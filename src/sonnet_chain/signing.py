@@ -6,7 +6,8 @@ import time
 import unicodedata
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MULTICODEC_ED25519 = b"\xed\x01"
@@ -23,9 +24,47 @@ def _b58(raw: bytes) -> str:
     return "1" * zeros + (out or "")
 
 
+def _b58decode(value: str) -> bytes:
+    n = 0
+    for char in value:
+        try:
+            digit = B58.index(char)
+        except ValueError as exc:
+            raise ValueError("invalid base58 character") from exc
+        n = n * 58 + digit
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\x00" * (len(value) - len(value.lstrip("1"))) + raw
+
+
 def did_of(key: Ed25519PrivateKey) -> str:
     pub = key.public_key().public_bytes_raw()
     return "did:key:z" + _b58(MULTICODEC_ED25519 + pub)
+
+
+def public_key_of_did(did: str) -> Ed25519PublicKey:
+    prefix = "did:key:z"
+    if not did.startswith(prefix):
+        raise ValueError("expected did:key with base58btc key")
+    decoded = _b58decode(did[len(prefix) :])
+    if len(decoded) != 34 or decoded[:2] != MULTICODEC_ED25519:
+        raise ValueError("DID is not an Ed25519 did:key")
+    return Ed25519PublicKey.from_public_bytes(decoded[2:])
+
+
+def verify_room_signature(room: str, did: str, nonce: str | int, text: str, sig: str) -> bool:
+    if not isinstance(text, str) or not isinstance(sig, str):
+        return False
+    nonce_text = str(nonce)
+    if not nonce_text.isdecimal() or int(nonce_text) <= 0 or nonce_text.startswith("0"):
+        return False
+    try:
+        signature = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
+        public_key_of_did(did).verify(
+            signature, f"{room}|{nonce_text}|{sweep(text)}".encode("utf-8")
+        )
+    except (ValueError, InvalidSignature):
+        return False
+    return True
 
 
 def sweep(text: str) -> str:

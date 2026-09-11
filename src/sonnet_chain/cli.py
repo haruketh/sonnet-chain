@@ -74,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sp.add_parser("doctor")
 
+    run = sp.add_parser("run")
+    run.add_argument("--live", action="store_true")
+    run.add_argument("--max-cycles", type=int)
+
+    sp.add_parser("status")
+
     prep = sp.add_parser("prepare-package")
     prep.add_argument("--commit")
 
@@ -112,6 +118,35 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config.from_env()
 
     try:
+        if args.cmd == "run":
+            from .daemon import Daemon
+
+            if args.max_cycles is not None and args.max_cycles < 1:
+                raise RuntimeError("--max-cycles must be positive")
+            daemon = Daemon(cfg, live=args.live)
+            try:
+                return daemon.run(args.max_cycles)
+            finally:
+                daemon.close()
+        if args.cmd == "status":
+            from .state import StateStore
+
+            store = StateStore(cfg.state_db)
+            try:
+                cursor, generation = store.cursor(cfg.rules_room)
+                print(json.dumps({
+                    "phase": store.phase.value,
+                    "rules_room": cfg.rules_room,
+                    "rules_owner": store.get("rules_owner"),
+                    "rules_last_seq": cursor,
+                    "rules_generation": generation,
+                    "referee_did": store.get("referee_did"),
+                    "active_team": store.active_team(),
+                    "last_error": store.get("last_error"),
+                }, ensure_ascii=False, indent=2))
+            finally:
+                store.close()
+            return 0
         if args.cmd == "prepare-package":
             prepare_package(cfg.official_dir, args.commit or cfg.official_commit)
             return 0

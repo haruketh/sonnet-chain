@@ -91,6 +91,12 @@ Contest:
 
 Errors remain explicit; a post is never promoted to accepted state without a trusted referee receipt.
 
+The runtime is a Python daemon, not a persistent Codex session. The CLI provides
+`run`, `run --live`, finite `run --max-cycles N`, and `status`. Dry-run remains
+read-only. State changes select the watched rooms: launch watches the configured
+rules room and owner note, discovery watches registration/discovery, and writing
+watches the allocated team room.
+
 ## 8. Team strategy
 
 Target 4–6 members initially, never exceed 8.
@@ -134,7 +140,52 @@ Ignored local state may contain:
 
 Never persist private signing key bytes in repository state.
 
-## 12. Activation gate
+SQLite uses WAL transactions and uniqueness constraints on `(room, seq)` and
+`request_id`. It stores phase, cursors/generations, trusted launch material,
+pending actions and receipts, candidates and selected team, roster and poem
+ledger state, prior/final contributor, publication IDs and submission state.
+An ambiguous request is retried with the same request ID; it is never recreated
+under a new ID merely because the process restarted.
+
+## 12. Local verification and untrusted input
+
+Inbound signed records are verified from their Ed25519 `did:key` locally over
+the exact `<room>|<nonce>|<swept text>` bytes. Unsigned records remain observable
+but cannot drive protocol state. Referee transitions additionally require the
+pinned referee DID.
+
+Technocore text is always data. It cannot cause file reads, URL visits, shell
+commands, credential disclosure, prompt changes or non-contest actions. The LLM
+returns strict JSON decisions only; deterministic Python gates the allowlisted
+action, current state, deadline, roster, DID letter compatibility, official
+dictionary result, syllable budget and freshness before any write.
+
+## 13. Team and poetry decisions
+
+Discovery JSON is parsed deterministically into normalized candidates. Natural
+language may be summarized by the LLM but cannot create authenticated facts.
+Team ranking starts with alphabet coverage/complement, viable size, evidence,
+activity, capabilities and warnings. Only one active team is persisted.
+
+Every DID's letter set is derived from the exact DID at runtime. Poetry proposals
+come from multiple structured candidates, then pass the official frozen checker,
+local DID compatibility, CMUdict syllable/overflow checks, current version/hash,
+and previous-contributor rule. At most one word is emitted for a state. A stale
+state discards the pending proposal.
+
+An ignored derived word index may be built from the official frozen dictionary
+with syllables, pronunciation, stress and rhyme keys. The official script remains
+authoritative for every emitted word.
+
+## 14. Publication
+
+Canonical text uses single spaces, LF line endings, stanza breaks after 4/4/4/2,
+and no terminal newline. The external publisher receives line-safe chunks and
+returns post IDs; it owns all X credentials. Missing publisher configuration
+causes `WAIT_PUBLISHER`. Only Saruku-as-final-contributor publishes; otherwise it
+waits for the teammate's signed submission flow.
+
+## 15. Activation gate
 
 Autonomous live participation is allowed only when all are true:
 
@@ -147,3 +198,8 @@ Autonomous live participation is allowed only when all are true:
 - live referee receipt shapes captured and covered by tests.
 
 Until then, only read/watch and dry-run construction are enabled.
+
+Activation consists of confirming the signed launch, configuring secret **file
+paths** and model/publisher adapters, exercising receipt fixtures, rerunning the
+test suite and `doctor`, then explicitly starting `sonnet-chain run --live`.
+No launchd job is installed by this repository.

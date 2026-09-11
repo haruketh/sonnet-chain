@@ -37,7 +37,7 @@ class Technocore:
         self.client.close()
 
     def read(self, room: str, since: int = 0, wait: int = 0) -> list[RoomRecord]:
-        params = {"format": "json", "since": since}
+        params = {"format": "json", "since": since, "limit": 200}
         if wait:
             params["wait"] = max(0, min(10, wait))
         r = self.client.get(f"{self.base_url}/r/{room}", params=params)
@@ -51,6 +51,46 @@ class Technocore:
             if isinstance(text, str):
                 out.append(RoomRecord(seq=seq, sender=sender if isinstance(sender, str) else None, text=text, raw=item))
         return out
+
+    def read_page(self, room: str, since: int = 0, wait: int = 0) -> tuple[list[RoomRecord], int | None]:
+        params = {"format": "json", "since": since, "limit": 200}
+        if wait:
+            params["wait"] = max(0, min(10, wait))
+        r = self.client.get(f"{self.base_url}/r/{room}", params=params)
+        r.raise_for_status()
+        data = r.json()
+        first_seq = data.get("first_seq") if isinstance(data, dict) else None
+        if isinstance(first_seq, int) and first_seq > since + 1:
+            export = self.client.get(f"{self.base_url}/r/{room}/export")
+            export.raise_for_status()
+            items = []
+            for line in export.text.splitlines():
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and int(item.get("seq", 0) or 0) > since:
+                    items.append(item)
+            data = {"messages": items, "generation": int(export.headers.get("X-Room-Generation", "0") or 0)}
+        records = []
+        for item in _records_from_json(data):
+            seq = int(item.get("seq", 0) or 0)
+            text = item.get("text", "")
+            sender = item.get("from")
+            if isinstance(text, str):
+                records.append(RoomRecord(seq, sender if isinstance(sender, str) else None, text, item))
+        generation = data.get("generation") if isinstance(data, dict) else None
+        return records, generation if isinstance(generation, int) else None
+
+    def owner_note(self, room: str) -> Any | None:
+        r = self.client.get(f"{self.base_url}/kv/room-owners/{room}")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        try:
+            return r.json()
+        except json.JSONDecodeError:
+            return r.text
 
     def watch(self, room: str, since: int = 0) -> Iterator[RoomRecord]:
         cursor = since

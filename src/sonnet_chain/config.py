@@ -19,10 +19,16 @@ class Config:
     manifest_sha256: str | None
     official_dir: Path
     official_commit: str
+    state_db: Path = Path("state/sonnet-chain.sqlite3")
+    rules_room: str = "d-sonnet-1-rules"
+    openai_api_key_file: Path | None = None
+    model: str = "gpt-5.1"
+    x_publish_cmd: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
         seed = os.getenv("SONNET_SEED_FILE")
+        api_key = os.getenv("SONNET_OPENAI_API_KEY_FILE")
         return cls(
             technocore_url=os.getenv("TECHNOCORE_URL", "https://technocore.chat").rstrip("/"),
             seed_file=Path(seed).expanduser() if seed else None,
@@ -31,4 +37,9 @@ class Config:
             manifest_sha256=(os.getenv("SONNET_MANIFEST_SHA256") or "").lower() or None,
             official_dir=Path(os.getenv("SONNET_OFFICIAL_DIR", ".official/technocore-sonnet-challange")),
             official_commit=os.getenv("SONNET_OFFICIAL_COMMIT", CANDIDATE_COMMIT),
+            state_db=Path(os.getenv("SONNET_STATE_DB", "state/sonnet-chain.sqlite3")),
+            rules_room=os.getenv("SONNET_RULES_ROOM", "d-sonnet-1-rules"),
+            openai_api_key_file=Path(api_key).expanduser() if api_key else None,
+            model=os.getenv("SONNET_MODEL", "gpt-5.1"),
+            x_publish_cmd=os.getenv("SONNET_X_PUBLISH_CMD") or None,
         )
