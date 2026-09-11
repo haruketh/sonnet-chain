@@ -81,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_parser("status")
 
     sp.add_parser("llm-check")
+    sp.add_parser("x-configure")
+    sp.add_parser("x-auth")
+    sp.add_parser("x-status")
 
     prep = sp.add_parser("prepare-package")
     prep.add_argument("--commit")
@@ -163,6 +166,34 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("LLM connectivity check failed deterministic validation")
             print(json.dumps({"connected": True, "model": cfg.model, "action": "ignore"}))
             return 0
+        if args.cmd == "x-configure":
+            from .x_oauth import configure_credentials
+
+            directory = (cfg.x_client_id_file.parent if cfg.x_client_id_file else Path("/Users/flop/.sonnet-x"))
+            configure_credentials(directory)
+            print("Sonnet X client credentials saved securely (mode 600).")
+            return 0
+        if args.cmd in {"x-auth", "x-status"}:
+            from .x_oauth import XTokenManager, authorize
+
+            manager = XTokenManager(
+                cfg.x_client_id_file, cfg.x_client_secret_file, cfg.x_token_file,
+                cfg.x_expected_username,
+            )
+            try:
+                if args.cmd == "x-status":
+                    print(json.dumps(manager.status(), ensure_ascii=False, indent=2))
+                    return 0
+                identity = authorize(manager, cfg.x_redirect_uri)
+                status = manager.status()
+                print(json.dumps({
+                    "authenticated": True, "username": identity.username,
+                    "user_id": identity.user_id,
+                    "refresh_available": status["refresh_available"],
+                }, ensure_ascii=False, indent=2))
+                return 0
+            finally:
+                manager.close()
         if args.cmd == "prepare-package":
             prepare_package(cfg.official_dir, args.commit or cfg.official_commit)
             return 0

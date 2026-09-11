@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import tempfile
 from pathlib import Path
 
 
@@ -36,3 +37,44 @@ def read_private_file(path: Path, max_bytes: int) -> bytes:
     if len(data) > max_bytes:
         raise SecureFileError("secret file exceeds size limit")
     return data
+
+
+def require_private_directory(path: Path, create: bool = False) -> None:
+    if create:
+        path.mkdir(mode=0o700, parents=False, exist_ok=True)
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SecureFileError("private directory is unsafe")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise SecureFileError("private directory owner or permissions are unsafe")
+
+
+def atomic_write_private(path: Path, data: bytes, max_bytes: int = 65_536) -> None:
+    if not path.is_absolute() or len(data) > max_bytes:
+        raise SecureFileError("private file target or size is invalid")
+    require_private_directory(path.parent)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise SecureFileError("private file write did not complete")
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

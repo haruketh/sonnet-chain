@@ -10,6 +10,27 @@ from sonnet_chain.secure_files import SecureFileError, read_private_file
 from sonnet_chain.x_publisher_adapter import XPublisherAdapter, XPublisherError
 
 
+class FakeTokenManager:
+    def __init__(self, token="test-token", refreshed="refreshed-token"):
+        self.token = token
+        self.refreshed = refreshed
+        self.refreshes = 0
+
+    def get_valid_access_token(self):
+        return self.token
+
+    def verify_identity(self, token):
+        return None
+
+    def is_current(self, token):
+        return token == self.token
+
+    def refresh(self, token):
+        self.refreshes += 1
+        self.token = self.refreshed
+        return self.token
+
+
 def private_json(path: Path, value: dict) -> Path:
     path.write_text(json.dumps(value), encoding="utf-8")
     path.chmod(0o600)
@@ -25,7 +46,7 @@ def test_secure_reader_rejects_world_readable_file(tmp_path: Path):
 
 
 def test_x_publisher_dry_run_never_reads_credentials(tmp_path: Path):
-    adapter = XPublisherAdapter(None, tmp_path / "publisher.db")
+    adapter = XPublisherAdapter(FakeTokenManager(), tmp_path / "publisher.db")
     try:
         result = adapter.publish(["line one\nline two", "line three"], dry_run=True)
     finally:
@@ -40,9 +61,8 @@ def test_x_thread_post_ids_are_persisted_and_reused(tmp_path: Path):
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
         return httpx.Response(200, json={"data": {"id": str(len(requests))}})
-    token = private_json(tmp_path / "tokens.json", {"access_token": "test-token"})
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    adapter = XPublisherAdapter(token, tmp_path / "publisher.db", client)
+    adapter = XPublisherAdapter(FakeTokenManager(), tmp_path / "publisher.db", client)
     try:
         first = adapter.publish(["first", "second"], dry_run=False)
         second = adapter.publish(["first", "second"], dry_run=False)
@@ -59,8 +79,7 @@ def test_ambiguous_x_response_blocks_duplicate_retry(tmp_path: Path):
         nonlocal calls
         calls += 1
         raise httpx.ReadTimeout("ambiguous", request=request)
-    token = private_json(tmp_path / "tokens.json", {"access_token": "test-token"})
-    adapter = XPublisherAdapter(token, tmp_path / "publisher.db", httpx.Client(transport=httpx.MockTransport(handler)))
+    adapter = XPublisherAdapter(FakeTokenManager(), tmp_path / "publisher.db", httpx.Client(transport=httpx.MockTransport(handler)))
     try:
         with pytest.raises(XPublisherError, match="ambiguous"):
             adapter.publish(["first"], dry_run=False)
@@ -71,18 +90,17 @@ def test_ambiguous_x_response_blocks_duplicate_retry(tmp_path: Path):
     assert calls == 1
 
 
-def test_definite_x_rejection_can_retry_after_credential_fix(tmp_path: Path):
+def test_definite_non_auth_x_rejection_can_retry(tmp_path: Path):
     calls = 0
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
         if calls == 1:
-            return httpx.Response(401, json={})
+            return httpx.Response(403, json={})
         return httpx.Response(200, json={"data": {"id": "ok"}})
-    token = private_json(tmp_path / "tokens.json", {"access_token": "test-token"})
-    adapter = XPublisherAdapter(token, tmp_path / "publisher.db", httpx.Client(transport=httpx.MockTransport(handler)))
+    adapter = XPublisherAdapter(FakeTokenManager(), tmp_path / "publisher.db", httpx.Client(transport=httpx.MockTransport(handler)))
     try:
-        with pytest.raises(XPublisherError, match="HTTP 401"):
+        with pytest.raises(XPublisherError, match="HTTP 403"):
             adapter.publish(["first"], dry_run=False)
         assert adapter.publish(["first"], dry_run=False)["post_ids"] == ["ok"]
     finally:

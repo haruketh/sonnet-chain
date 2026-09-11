@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from .publisher import weighted_length
-from .secure_files import read_private_file
+from .x_oauth import XAuthRequired, XOAuthError, XTokenManager
 
 X_POST_URL = "https://api.x.com/2/tweets"
 
@@ -21,25 +21,13 @@ class XPublisherError(RuntimeError):
 
 
 class XPublisherAdapter:
-    def __init__(self, token_file: Path | None, state_db: Path, client: httpx.Client | None = None):
-        self.token_file = token_file
+    def __init__(self, token_manager: XTokenManager, state_db: Path, client: httpx.Client | None = None):
+        self.token_manager = token_manager
         self.state_db = state_db
         self.client = client or httpx.Client(timeout=30, follow_redirects=False)
 
     def close(self) -> None:
         self.client.close()
-
-    def _token(self) -> str:
-        if self.token_file is None:
-            raise XPublisherError("SONNET_X_TOKEN_FILE is not set")
-        try:
-            data = json.loads(read_private_file(self.token_file, 32_768))
-            token = data["access_token"]
-        except (OSError, RuntimeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise XPublisherError("X credential file is unavailable or unsafe") from exc
-        if not isinstance(token, str) or not token:
-            raise XPublisherError("X credential file has no access token")
-        return token
 
     @staticmethod
     def _validate(posts: Any) -> list[str]:
@@ -53,7 +41,11 @@ class XPublisherAdapter:
         posts = self._validate(posts)
         if dry_run:
             return {"dry_run": True, "post_ids": [f"dry-run-{i + 1}" for i in range(len(posts))], "posts": posts}
-        token = self._token()
+        try:
+            token = self.token_manager.get_valid_access_token()
+            self.token_manager.verify_identity(token)
+        except XOAuthError as exc:
+            raise XAuthRequired("X_AUTH_REQUIRED: token or identity validation failed") from exc
         digest = hashlib.sha256(json.dumps(posts, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
         self.state_db.parent.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(self.state_db)
@@ -91,9 +83,34 @@ class XPublisherAdapter:
                 if parent:
                     body["reply"] = {"in_reply_to_tweet_id": parent}
                 try:
-                    response = self.client.post(
-                        X_POST_URL, headers={"Authorization": f"Bearer {token}"}, json=body
-                    )
+                    response = self.client.post(X_POST_URL, headers={"Authorization": f"Bearer {token}"}, json=body)
+                    if response.status_code == 401:
+                        try:
+                            token = self.token_manager.refresh(token) if self.token_manager.is_current(token) else self.token_manager.get_valid_access_token()
+                        except XOAuthError as exc:
+                            with db:
+                                db.execute(
+                                    "UPDATE publication_posts SET status='rejected' WHERE poem_hash=? AND part=?",
+                                    (digest, index),
+                                )
+                            raise XAuthRequired("X_AUTH_REQUIRED: token refresh or identity validation failed") from exc
+                        try:
+                            self.token_manager.verify_identity(token)
+                        except XOAuthError as exc:
+                            with db:
+                                db.execute(
+                                    "UPDATE publication_posts SET status='rejected' WHERE poem_hash=? AND part=?",
+                                    (digest, index),
+                                )
+                            raise XAuthRequired("X_AUTH_REQUIRED: refreshed identity validation failed") from exc
+                        response = self.client.post(X_POST_URL, headers={"Authorization": f"Bearer {token}"}, json=body)
+                        if response.status_code == 401:
+                            with db:
+                                db.execute(
+                                    "UPDATE publication_posts SET status='rejected' WHERE poem_hash=? AND part=?",
+                                    (digest, index),
+                                )
+                            raise XAuthRequired("X_AUTH_REQUIRED: repeated HTTP 401")
                     if response.status_code >= 400:
                         with db:
                             db.execute(
@@ -102,7 +119,7 @@ class XPublisherAdapter:
                             )
                         raise XPublisherError(f"X rejected the post with HTTP {response.status_code}")
                     post_id = response.json()["data"]["id"]
-                except XPublisherError:
+                except (XPublisherError, XAuthRequired):
                     raise
                 except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                     raise XPublisherError("X post failed or response was ambiguous") from exc
@@ -131,13 +148,21 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(sys.stdin.read(65_537))
         if not isinstance(payload, dict) or set(payload) != {"posts"}:
             raise XPublisherError("publisher accepts only a posts payload")
-        adapter = XPublisherAdapter(cfg.x_token_file, cfg.x_publish_state_db)
+        manager = XTokenManager(
+            cfg.x_client_id_file, cfg.x_client_secret_file, cfg.x_token_file,
+            cfg.x_expected_username,
+        )
+        adapter = XPublisherAdapter(manager, cfg.x_publish_state_db)
         try:
             result = adapter.publish(payload["posts"], args.dry_run)
         finally:
             adapter.close()
+            manager.close()
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         return 0
+    except XAuthRequired as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 3
     except (OSError, json.JSONDecodeError, XPublisherError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

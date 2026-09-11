@@ -17,7 +17,7 @@ from .llm import DISCOVERY_SCHEMA, LLMClient, LLMUnavailable, RECEIPT_SCHEMA, TE
 from .official import sha256, verify_package
 from .poetry import PoemState, build_word_index, validate_candidate
 from .protocol import register_writer, request_id, roster, submit, team_request, word
-from .publisher import CommandPublisher, PublisherUnavailable, canonical_poem
+from .publisher import CommandPublisher, PublisherAuthRequired, PublisherUnavailable, canonical_poem
 from .receipts import normalize_llm_receipt, receipt_candidate, receipt_matches
 from .signing import verify_room_signature
 from .state import Phase, StateStore
@@ -397,6 +397,10 @@ class Daemon:
         lines = self.state.get("poem_lines", [])
         try:
             post_ids = CommandPublisher(self.cfg.x_publish_cmd).publish(canonical_poem(lines))
+        except PublisherAuthRequired as exc:
+            self.state.set("last_error", str(exc))
+            self.state.phase = Phase.X_AUTH_REQUIRED
+            return
         except (PublisherUnavailable, ValueError) as exc:
             self.state.set("last_error", f"PublisherUnavailable: {exc}")
             self.state.phase = Phase.WAIT_PUBLISHER

@@ -184,11 +184,12 @@ It receives JSON containing line-safe post chunks on stdin and must return
 remain external. Without the adapter the daemon persists the poem and stops in
 `WAIT_PUBLISHER`; it never attempts to discover X credentials.
 
-The bundled `sonnet-chain-x-publisher` adapter reads an existing X token JSON
-through `SONNET_X_TOKEN_FILE`. It never refreshes or modifies that shared token.
-It records each part as pending in a separate SQLite database before a request;
-an ambiguous response therefore stops instead of risking a duplicate. Completed
-post IDs are reused after restart, and replies are chained in line order.
+The bundled `sonnet-chain-x-publisher` adapter uses only the dedicated Sonnet X
+OAuth files under `/Users/flop/.sonnet-x`; it never reads or modifies Saruku's
+production X credentials. It records each part as pending in a separate SQLite
+database before a request; an ambiguous response therefore stops instead of
+risking a duplicate. Completed post IDs are reused after restart, and replies
+are chained in line order.
 
 Exercise only its dry-run path with:
 
@@ -206,12 +207,42 @@ values out of it; use absolute paths such as:
 ```text
 SONNET_SEED_FILE=/absolute/path/to/existing-seed
 SONNET_OPENAI_API_KEY_FILE=/absolute/path/to/existing-key-file
-SONNET_X_TOKEN_FILE=/absolute/path/to/existing-token-json
+SONNET_X_CLIENT_ID_FILE=/Users/flop/.sonnet-x/client_id
+SONNET_X_CLIENT_SECRET_FILE=/Users/flop/.sonnet-x/client_secret
+SONNET_X_TOKEN_FILE=/Users/flop/.sonnet-x/oauth_tokens.json
 ```
 
 Environment variables already present in the process take precedence. Secret
 files must be owner-only regular files (mode 600); symlinks and oversized files
 are rejected.
+
+## Dedicated X OAuth authorization
+
+The implementation follows X's OAuth 2.0 Authorization Code Flow with PKCE for
+a confidential Web/Automated App: S256 PKCE, HTTP Basic client authentication at
+the token endpoint, exact callback URI matching, and these scopes only:
+`tweet.read tweet.write users.read offline.access`.
+
+Enter the new Sonnet App credentials in a local terminal; both prompts are
+hidden and values are written directly as mode-600 files:
+
+```bash
+sonnet-chain x-configure
+sonnet-chain x-auth
+sonnet-chain x-status
+```
+
+`x-auth` binds only `127.0.0.1:8765`, opens the X authorize page, validates the
+callback state and code, exchanges immediately, verifies `@sarukubt` with
+`/2/users/me`, then atomically stores the dedicated token and public identity.
+It never posts to X.
+
+The token manager refreshes when less than five minutes remain, under a mode-600
+file lock. A rotated refresh token atomically replaces the old value. Publisher
+HTTP 401 handling performs at most one refresh and one retry; a second 401 moves
+the daemon to `X_AUTH_REQUIRED` without discarding the frozen poem.
+
+See the [official X OAuth 2.0 Authorization Code Flow with PKCE documentation](https://docs.x.com/fundamentals/authentication/oauth-2-0/authorization-code).
 
 ## Recovery
 

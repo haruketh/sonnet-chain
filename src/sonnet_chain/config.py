@@ -28,6 +28,10 @@ class Config:
     x_publish_cmd: str | None = None
     x_token_file: Path | None = None
     x_publish_state_db: Path = Path("state/publisher.sqlite3")
+    x_client_id_file: Path | None = None
+    x_client_secret_file: Path | None = None
+    x_redirect_uri: str = "http://127.0.0.1:8765/callback"
+    x_expected_username: str = "sarukubt"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -37,6 +41,8 @@ class Config:
         seed = os.getenv("SONNET_SEED_FILE")
         api_key = os.getenv("SONNET_OPENAI_API_KEY_FILE")
         x_token = os.getenv("SONNET_X_TOKEN_FILE")
+        x_client_id = os.getenv("SONNET_X_CLIENT_ID_FILE")
+        x_client_secret = os.getenv("SONNET_X_CLIENT_SECRET_FILE")
         return cls(
             technocore_url=os.getenv("TECHNOCORE_URL", "https://technocore.chat").rstrip("/"),
             seed_file=Path(seed).expanduser() if seed else None,
@@ -52,12 +58,18 @@ class Config:
             x_publish_cmd=os.getenv("SONNET_X_PUBLISH_CMD") or None,
             x_token_file=Path(x_token).expanduser() if x_token else None,
             x_publish_state_db=Path(os.getenv("SONNET_X_PUBLISH_STATE_DB", "state/publisher.sqlite3")),
+            x_client_id_file=Path(x_client_id).expanduser() if x_client_id else None,
+            x_client_secret_file=Path(x_client_secret).expanduser() if x_client_secret else None,
+            x_redirect_uri=os.getenv("SONNET_X_REDIRECT_URI", "http://127.0.0.1:8765/callback"),
+            x_expected_username=os.getenv("SONNET_X_EXPECTED_USERNAME", "sarukubt").lstrip("@"),
         )
 
 
 RUNTIME_KEYS = {
     "SONNET_SEED_FILE", "SONNET_X_ACCOUNT_URL", "SONNET_OPENAI_API_KEY_FILE",
     "SONNET_MODEL", "SONNET_X_PUBLISH_CMD", "SONNET_X_TOKEN_FILE",
+    "SONNET_X_CLIENT_ID_FILE", "SONNET_X_CLIENT_SECRET_FILE", "SONNET_X_REDIRECT_URI",
+    "SONNET_X_EXPECTED_USERNAME",
     "SONNET_X_PUBLISH_STATE_DB", "SONNET_REFEREE_DID", "SONNET_MANIFEST_SHA256",
     "SONNET_OFFICIAL_DIR", "SONNET_OFFICIAL_COMMIT", "SONNET_RULES_ROOM",
     "SONNET_STATE_DB", "TECHNOCORE_URL",

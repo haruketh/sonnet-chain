@@ -10,6 +10,10 @@ class PublisherUnavailable(RuntimeError):
     pass
 
 
+class PublisherAuthRequired(PublisherUnavailable):
+    pass
+
+
 def canonical_poem(lines: list[str]) -> str:
     if len(lines) != 14 or any(not line.strip() for line in lines):
         raise ValueError("a complete poem requires 14 nonempty lines")
@@ -56,6 +60,8 @@ class CommandPublisher:
             self.argv, input=json.dumps({"posts": split_posts(poem)}), text=True,
             capture_output=True, check=False, timeout=120,
         )
+        if proc.returncode == 3:
+            raise PublisherAuthRequired("X_AUTH_REQUIRED")
         if proc.returncode:
             raise PublisherUnavailable("publisher command failed")
         try:

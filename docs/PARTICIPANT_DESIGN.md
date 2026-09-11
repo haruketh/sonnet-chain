@@ -185,22 +185,35 @@ returns post IDs; it owns all X credentials. Missing publisher configuration
 causes `WAIT_PUBLISHER`. Only Saruku-as-final-contributor publishes; otherwise it
 waits for the teammate's signed submission flow.
 
-The bundled adapter does not import or execute the production X posting code.
-It reads a configured existing access-token JSON without updating or refreshing
-it, posts only the supplied poem chunks to the fixed X endpoint, and uses a
-Sonnet-only SQLite journal. Before each network request the part becomes
+The bundled adapter does not import or execute the production X posting code and
+never reads its credentials. It uses only the dedicated Sonnet OAuth app files,
+posts only the supplied poem chunks to the fixed X endpoint, and uses a Sonnet-only
+SQLite journal. Before each network request the part becomes
 `pending`; if a crash makes the outcome ambiguous, restart refuses to duplicate
 that part. A confirmed response stores its post ID, and later parts reply to the
 previous ID. Dry-run mode does not read credentials or contact X.
+
+Initial authorization uses OAuth 2.0 Authorization Code with S256 PKCE. The
+callback server binds only `127.0.0.1:8765`, validates exact path/state/code, and
+stops after one request. The confidential client authenticates to the X token
+endpoint using HTTP Basic; the client secret never appears in a URL or form body.
+The requested scopes are exactly `tweet.read tweet.write users.read offline.access`.
+
+Dedicated tokens are atomically replaced with mode 600. A file lock serializes
+refresh across processes, and a returned rotated refresh token replaces the old
+one. Access tokens refresh within five minutes of expiry. Initial authorization
+and refresh verify the expected username; a persisted public X user ID prevents
+silently switching accounts. One publisher 401 permits one refresh and one retry;
+a repeated 401 transitions to `X_AUTH_REQUIRED` without changing poem state.
 
 ## 15. Credential connection
 
 `runtime.env` is a local, ignored, mode-600 allowlisted key/value file. Values
 are literal—there is no shell evaluation or interpolation. It should contain
-paths to the existing Ed25519 seed, OpenAI key file and X token JSON rather than
-secret values. Secret readers reject symlinks, wrong ownership, modes other than
-600 and oversized content. Neither API key nor token is persisted to daemon
-SQLite, logs or output.
+paths to the existing Ed25519 seed and OpenAI key, plus the separate Sonnet X
+client/token files, rather than secret values. Secret readers reject symlinks,
+wrong ownership, modes other than 600 and oversized content. Neither API key nor
+OAuth token is persisted to daemon SQLite, logs or output.
 
 ## 16. Activation gate
 
