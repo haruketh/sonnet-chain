@@ -1,0 +1,1 @@
+"""Sonnet Chain participant runtime."""
