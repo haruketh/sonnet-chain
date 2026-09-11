@@ -8,6 +8,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+runtime.env
 state/
 logs/
 output/

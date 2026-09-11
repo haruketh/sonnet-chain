@@ -19,6 +19,7 @@ dev = [
 
 [project.scripts]
 sonnet-chain = "sonnet_chain.cli:main"
+sonnet-chain-x-publisher = "sonnet_chain.x_publisher_adapter:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

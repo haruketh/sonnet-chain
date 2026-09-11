@@ -12,6 +12,7 @@ def test_signer_seed(tmp_path: Path):
     seed = bytes(range(32))
     p = tmp_path / "seed"
     p.write_bytes(seed)
+    p.chmod(0o600)
     signer = Signer(p)
     nonce = "1"
     stored, sig = signer.sign_room("room", nonce, "hello")

@@ -160,6 +160,12 @@ export SONNET_OPENAI_API_KEY_FILE=/absolute/path/to/openai-api-key
 export SONNET_MODEL=gpt-5.1
 ```
 
+Connection and injection-handling check (no Technocore write):
+
+```bash
+sonnet-chain llm-check
+```
+
 The adapter uses the Responses API with strict structured output. Technocore
 text is labeled untrusted data. The model cannot invoke tools: Python accepts
 only allowlisted decision values and deterministically rechecks every proposed
@@ -177,6 +183,35 @@ It receives JSON containing line-safe post chunks on stdin and must return
 `{"post_ids":["..."]}` on stdout. It is launched without a shell. Credentials
 remain external. Without the adapter the daemon persists the poem and stops in
 `WAIT_PUBLISHER`; it never attempts to discover X credentials.
+
+The bundled `sonnet-chain-x-publisher` adapter reads an existing X token JSON
+through `SONNET_X_TOKEN_FILE`. It never refreshes or modifies that shared token.
+It records each part as pending in a separate SQLite database before a request;
+an ambiguous response therefore stops instead of risking a duplicate. Completed
+post IDs are reused after restart, and replies are chained in line order.
+
+Exercise only its dry-run path with:
+
+```bash
+printf '%s' '{"posts":["first line","second line"]}' \
+  | sonnet-chain-x-publisher --dry-run
+```
+
+## Local runtime environment
+
+`runtime.env` is optional, automatically loaded without shell evaluation, must
+be owned by the current user with mode 600, and is ignored by Git. Keep secret
+values out of it; use absolute paths such as:
+
+```text
+SONNET_SEED_FILE=/absolute/path/to/existing-seed
+SONNET_OPENAI_API_KEY_FILE=/absolute/path/to/existing-key-file
+SONNET_X_TOKEN_FILE=/absolute/path/to/existing-token-json
+```
+
+Environment variables already present in the process take precedence. Secret
+files must be owner-only regular files (mode 600); symlinks and oversized files
+are rejected.
 
 ## Recovery
 

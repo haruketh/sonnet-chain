@@ -9,6 +9,8 @@ from pathlib import Path
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+from .secure_files import read_private_file
+
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MULTICODEC_ED25519 = b"\xed\x01"
 INVISIBLE = {"Cc", "Cf", "Cs", "Co", "Zl", "Zp"}
@@ -72,7 +74,7 @@ def sweep(text: str) -> str:
 
 
 def load_seed(path: Path) -> bytes:
-    raw = path.read_bytes()
+    raw = read_private_file(path, 4096)
     if len(raw) == 32:
         return raw
 

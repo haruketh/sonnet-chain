@@ -185,7 +185,24 @@ returns post IDs; it owns all X credentials. Missing publisher configuration
 causes `WAIT_PUBLISHER`. Only Saruku-as-final-contributor publishes; otherwise it
 waits for the teammate's signed submission flow.
 
-## 15. Activation gate
+The bundled adapter does not import or execute the production X posting code.
+It reads a configured existing access-token JSON without updating or refreshing
+it, posts only the supplied poem chunks to the fixed X endpoint, and uses a
+Sonnet-only SQLite journal. Before each network request the part becomes
+`pending`; if a crash makes the outcome ambiguous, restart refuses to duplicate
+that part. A confirmed response stores its post ID, and later parts reply to the
+previous ID. Dry-run mode does not read credentials or contact X.
+
+## 15. Credential connection
+
+`runtime.env` is a local, ignored, mode-600 allowlisted key/value file. Values
+are literal—there is no shell evaluation or interpolation. It should contain
+paths to the existing Ed25519 seed, OpenAI key file and X token JSON rather than
+secret values. Secret readers reject symlinks, wrong ownership, modes other than
+600 and oversized content. Neither API key nor token is persisted to daemon
+SQLite, logs or output.
+
+## 16. Activation gate
 
 Autonomous live participation is allowed only when all are true:
 

@@ -130,6 +130,18 @@ def test_room_generation_change_resets_cursor(tmp_path: Path):
     store.close()
 
 
+def test_non_live_internal_post_is_refused_without_count(tmp_path: Path):
+    daemon = Daemon.__new__(Daemon)
+    daemon.live = False
+    daemon.state = StateStore(tmp_path / "state.db")
+    try:
+        with pytest.raises(RuntimeError, match="non-live POST"):
+            daemon._post("room", {"text": "never"})
+        assert daemon.state.get("technocore_write_attempts") == 0
+    finally:
+        daemon.state.close()
+
+
 def test_team_candidate_extraction():
     raw = {"seq": 9, "from": "did:key:zLead", "ts": "now", "text": json.dumps({"type": "sonnet.recruit.v1", "game_id": "g1", "open_seats": 2, "target_size": 5, "capabilities": ["planning"]})}
     team = parse_protocol_candidate(raw)

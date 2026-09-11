@@ -59,7 +59,10 @@ class CommandPublisher:
         if proc.returncode:
             raise PublisherUnavailable("publisher command failed")
         try:
-            post_ids = json.loads(proc.stdout)["post_ids"]
+            result = json.loads(proc.stdout)
+            if result.get("dry_run") is True:
+                raise PublisherUnavailable("publisher adapter remained in dry-run mode")
+            post_ids = result["post_ids"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise PublisherUnavailable("publisher returned invalid JSON") from exc
         if not isinstance(post_ids, list) or not post_ids or not all(isinstance(x, str) and x for x in post_ids):

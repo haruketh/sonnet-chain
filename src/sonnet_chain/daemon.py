@@ -51,6 +51,12 @@ class Daemon:
         self.tc.close()
         self.state.close()
 
+    def _post(self, room: str, payload: dict) -> None:
+        if not self.live:
+            raise RuntimeError("internal safety gate refused a non-live POST")
+        self.state.increment("technocore_write_attempts")
+        emit_or_post(self.cfg, room, payload, True)
+
     def _read(self, room: str) -> list[dict[str, Any]]:
         cursor, stored_generation = self.state.cursor(room)
         records, generation = self.tc.read_page(room, cursor, self.wait)
@@ -117,7 +123,7 @@ class Daemon:
         signer_from(self.cfg)
         if pending is None:
             self.state.reserve_request(payload["request_id"], "register", payload)
-        emit_or_post(self.cfg, REGISTRATION_ROOM, payload, True)
+        self._post(REGISTRATION_ROOM, payload)
         self.state.phase = Phase.WAIT_REGISTRATION_RECEIPT
 
     def _receipts(self, room: str) -> None:
@@ -287,7 +293,7 @@ class Daemon:
             return
         if pending is None:
             self.state.reserve_request(payload["request_id"], kind, payload)
-        emit_or_post(self.cfg, DISCOVERY_ROOM, payload, True)
+        self._post(DISCOVERY_ROOM, payload)
         self.state.phase = Phase.WAIT_TEAM_SETUP
 
     def _wait_team_setup(self) -> None:
@@ -315,7 +321,7 @@ class Daemon:
             return
         if self.state.pending_request("roster") is None:
             self.state.reserve_request(payload["request_id"], "roster", payload)
-        emit_or_post(self.cfg, DISCOVERY_ROOM, payload, True)
+        self._post(DISCOVERY_ROOM, payload)
         self.state.phase = Phase.WAIT_ROSTER_READY
 
     def _writing(self) -> None:
@@ -341,7 +347,7 @@ class Daemon:
             if not self.live:
                 self.state.set("dry_run_action", pending)
                 return
-            emit_or_post(self.cfg, poem_room, pending, True)
+            self._post(poem_room, pending)
             return
         try:
             output = LLMClient(self.cfg.openai_api_key_file, self.cfg.model).structured(
@@ -374,7 +380,7 @@ class Daemon:
             self.state.set("dry_run_action", payload)
             return
         self.state.reserve_request(payload["request_id"], request_kind, payload)
-        emit_or_post(self.cfg, poem_room, payload, True)
+        self._post(poem_room, payload)
 
     def _poem_complete(self) -> None:
         if self.state.get("final_contributor") == SARUKU_DID:
@@ -396,6 +402,7 @@ class Daemon:
             self.state.phase = Phase.WAIT_PUBLISHER
             return
         self.state.set("x_post_ids", post_ids)
+        self.state.increment("x_write_count", len(post_ids))
         self.state.phase = Phase.SUBMIT
 
     def _submit(self) -> None:
@@ -417,7 +424,7 @@ class Daemon:
         )
         if self.state.pending_request("submit") is None:
             self.state.reserve_request(payload["request_id"], "submit", payload)
-        emit_or_post(self.cfg, SUBMISSIONS_ROOM, payload, True)
+        self._post(SUBMISSIONS_ROOM, payload)
         self.state.phase = Phase.WAIT_SUBMISSION_RECEIPT
 
     def cycle(self) -> None:
@@ -479,4 +486,6 @@ class Daemon:
             "referee_did": self.state.get("referee_did"),
             "active_team": self.state.active_team(),
             "last_error": self.state.get("last_error"),
+            "technocore_write_attempts": self.state.get("technocore_write_attempts", 0),
+            "x_write_count": self.state.get("x_write_count", 0),
         }

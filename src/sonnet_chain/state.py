@@ -78,6 +78,8 @@ class StateStore:
             "final_contributor": None,
             "x_post_ids": [],
             "submission_state": None,
+            "technocore_write_attempts": 0,
+            "x_write_count": 0,
         }
         for key, value in defaults.items():
             if self.get(key) is None:
@@ -170,6 +172,11 @@ class StateStore:
     def set_request_status(self, request_id: str, status: str) -> None:
         with self.db:
             self.db.execute("UPDATE requests SET status=? WHERE request_id=?", (status, request_id))
+
+    def increment(self, key: str, amount: int = 1) -> int:
+        value = int(self.get(key, 0) or 0) + amount
+        self.set(key, value)
+        return value
 
     def active_team(self) -> str | None:
         return self.get("active_team")
