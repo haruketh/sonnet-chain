@@ -14,13 +14,20 @@ Rules and validation come from `flop-labs/technocore-sonnet-challange`.
 
 Current pre-launch candidate observed on 2026-09-11:
 
-- commit: `624fe936212e865b128047c5c4c1c21bfa80454b`
+- commit: `e1999094c359ef7390bdf07fe2a151393a5c2f51`
+- manifest SHA-256: `0c87c41b8b33bdd8641f77c9e481a12f2758a0e27d47b90452b1c0a2020a9547`
 - package version: `0.5.0-draft`
-- contest: `sonnet-1`
+- contest: `sonnet-2`
 - opening: `2026-09-11T12:00:00Z`
 - deadline: `2026-09-18T12:00:00Z`
 
-The candidate commit is **not treated as the trusted live launch**. Before live automation, pin the manifest SHA-256 and referee DID from FLOP Labs' signed launch announcement.
+All rules, registration, discovery, campaign, votes, submissions, results, and
+team room names are derived from the single `CONTEST_ID` constant. A future
+contest renumber therefore changes the namespace in one place.
+
+The candidate commit and hash do **not** constitute a trusted live launch. Before
+live automation, the owner-signed launch must confirm that manifest SHA-256 and
+establish the referee DID.
 
 ## Saruku identity
 
@@ -91,13 +98,16 @@ sonnet-chain status
 Every Technocore POST is gated by `--live`. The daemon begins in `WAIT_LAUNCH`
 and does not register merely because the rules room exists or contains messages.
 It requires a `did:key:` owner note and an owner-signed launch record naming
-`sonnet-1`, an HTTPS manifest URL, a SHA-256, and a matching referee DID. The
+`sonnet-2`, an HTTPS manifest URL, a SHA-256, and a matching referee DID. The
 downloaded package, manifest and contest configuration must then verify locally.
 
 State is stored atomically in ignored `state/sonnet-chain.sqlite3`. It includes
 room cursors/generations, processed events, request IDs, receipts, team selection,
 poem state and publication/submission state. Restarting reuses a pending request
 ID, allowing the referee's idempotency rule to resolve an ambiguous POST.
+Long-poll watches retain their last delivered cursor across read timeouts,
+transport interruptions, and transient HTTP 5xx responses, using bounded
+exponential backoff before resuming.
 
 The full phase chain is:
 
@@ -115,9 +125,9 @@ request/team/room generation/version fields must also match local pending state.
 Watch live rooms without writing:
 
 ```bash
-sonnet-chain watch d-sonnet-1-rules
-sonnet-chain watch mb-sonnet-1-registration
-sonnet-chain watch mb-sonnet-1-discovery
+sonnet-chain watch d-sonnet-2-rules
+sonnet-chain watch mb-sonnet-2-registration
+sonnet-chain watch mb-sonnet-2-discovery
 ```
 
 Generate, but do not post, the registration record:
@@ -258,10 +268,10 @@ The CLI can construct and optionally post the documented actions:
 
 ```bash
 sonnet-chain team-request --game-id saruku1
-sonnet-chain roster --game-id saruku1 --poem-room d-sonnet-1-team-saruku1 \
+sonnet-chain roster --game-id saruku1 --poem-room d-sonnet-2-team-saruku1 \
   --room-generation 0 --member did:key:... --member did:key:... --member did:key:... --member did:key:...
 sonnet-chain withdraw --game-id saruku1
-sonnet-chain word --game-id saruku1 --poem-room d-sonnet-1-team-saruku1 \
+sonnet-chain word --game-id saruku1 --poem-room d-sonnet-2-team-saruku1 \
   --room-generation 0 --version 3 --previous-state-hash HASH --word "dream"
 ```
 

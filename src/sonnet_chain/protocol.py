@@ -5,7 +5,7 @@ import re
 import secrets
 from typing import Iterable
 
-from .config import CONTEST_ID
+from .config import CONTEST_ID, ROOMS
 
 GAME_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")
 
@@ -46,6 +46,8 @@ def roster(
     members: Iterable[str],
     rid: str | None = None,
 ) -> dict:
+    if poem_room != ROOMS.team(game_id):
+        raise ValueError("poem_room does not match the active contest team namespace")
     member_list = list(members)
     if not 4 <= len(member_list) <= 8:
         raise ValueError("roster must contain 4-8 members")
@@ -100,6 +102,8 @@ def submit(
     x_post_ids: list[str],
     rid: str | None = None,
 ) -> dict:
+    if poem_room != ROOMS.team(game_id):
+        raise ValueError("poem_room does not match the active contest team namespace")
     return {
         "type": "sonnet.submit.v1",
         "contest_id": CONTEST_ID,

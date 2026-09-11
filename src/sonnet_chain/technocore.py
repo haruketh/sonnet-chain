@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -94,11 +95,25 @@ class Technocore:
 
     def watch(self, room: str, since: int = 0) -> Iterator[RoomRecord]:
         cursor = since
+        backoff = 1.0
         while True:
-            records = self.read(room, since=cursor, wait=10)
+            try:
+                records = self.read(room, since=cursor, wait=10)
+            except httpx.TransportError:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                continue
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500 or exc.response.status_code > 599:
+                    raise
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                continue
+            backoff = 1.0
             for record in records:
-                if record.seq > cursor:
-                    cursor = record.seq
+                if record.seq <= cursor:
+                    continue
+                cursor = record.seq
                 yield record
 
     def post_signed(self, room: str, text: str, signer: Signer) -> httpx.Response:

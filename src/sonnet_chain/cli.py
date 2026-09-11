@@ -5,15 +5,11 @@ import json
 import sys
 from pathlib import Path
 
-from .config import Config, SARUKU_DID
+from .config import Config, ROOMS, SARUKU_DID
 from .official import check_word, prepare_package, verify_package
 from .protocol import compact, register_writer, roster, team_request, withdraw, word
 from .signing import Signer
 from .technocore import Technocore
-
-REGISTRATION_ROOM = "mb-sonnet-1-registration"
-DISCOVERY_ROOM = "mb-sonnet-1-discovery"
-
 
 def signer_from(cfg: Config) -> Signer:
     if cfg.seed_file is None:
@@ -210,15 +206,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "register":
             if not cfg.x_account_url:
                 raise RuntimeError("SONNET_X_ACCOUNT_URL is not set")
-            return emit_or_post(cfg, REGISTRATION_ROOM, register_writer(cfg.x_account_url), args.live)
+            return emit_or_post(cfg, ROOMS.registration, register_writer(cfg.x_account_url), args.live)
         if args.cmd == "team-request":
-            return emit_or_post(cfg, DISCOVERY_ROOM, team_request(args.game_id), args.live)
+            return emit_or_post(cfg, ROOMS.discovery, team_request(args.game_id), args.live)
         if args.cmd == "roster":
             payload = roster(args.game_id, args.poem_room, args.room_generation, args.member)
-            return emit_or_post(cfg, DISCOVERY_ROOM, payload, args.live)
+            return emit_or_post(cfg, ROOMS.discovery, payload, args.live)
         if args.cmd == "withdraw":
-            return emit_or_post(cfg, DISCOVERY_ROOM, withdraw(args.game_id), args.live)
+            return emit_or_post(cfg, ROOMS.discovery, withdraw(args.game_id), args.live)
         if args.cmd == "word":
+            if args.poem_room != ROOMS.team(args.game_id):
+                raise ValueError("poem-room does not match the active contest team namespace")
             result = check_word(cfg.official_dir, SARUKU_DID, args.word)
             print("official_word_check:", json.dumps(result, ensure_ascii=False))
             payload = word(

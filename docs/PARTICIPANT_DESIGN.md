@@ -2,7 +2,7 @@
 
 ## 1. Goal
 
-Run Saruku as an independent participant in FLOP Labs' official `sonnet-1` contest while preserving the official rules, signatures and referee authority.
+Run Saruku as an independent participant in FLOP Labs' official `sonnet-2` contest while preserving the official rules, signatures and referee authority.
 
 This experiment is intentionally isolated from Saruku's normal runtime.
 
@@ -45,14 +45,17 @@ Writer eligibility is assumed operationally for development because this DID has
 
 Known public contest rooms:
 
-- `d-sonnet-1-rules`
-- `mb-sonnet-1-registration`
-- `mb-sonnet-1-discovery`
-- `mb-sonnet-1-campaign`
-- `mb-sonnet-1-votes`
-- `mb-sonnet-1-submissions`
-- `d-sonnet-1-results`
-- allocated `d-sonnet-1-team-<game_id>` rooms
+- `d-sonnet-2-rules`
+- `mb-sonnet-2-registration`
+- `mb-sonnet-2-discovery`
+- `mb-sonnet-2-campaign`
+- `mb-sonnet-2-votes`
+- `mb-sonnet-2-submissions`
+- `d-sonnet-2-results`
+- allocated `d-sonnet-2-team-<game_id>` rooms
+
+These addresses are generated from the runtime's single contest ID rather than
+duplicated as independent string constants.
 
 ## 6. Transport
 

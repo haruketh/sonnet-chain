@@ -9,6 +9,7 @@ from .config import CONTEST_ID
 from .signing import verify_room_signature
 
 SHA256 = re.compile(r"[0-9a-fA-F]{64}")
+DID_KEY = re.compile(r"did:key:z[1-9A-HJ-NP-Za-km-z]+")
 
 
 @dataclass(frozen=True)
@@ -23,16 +24,17 @@ class TrustedLaunch:
 def owner_did(note: Any) -> str | None:
     if isinstance(note, str):
         value = note.strip()
-        if value.startswith("did:key:"):
+        if DID_KEY.fullmatch(value):
             return value
         try:
             return owner_did(json.loads(value))
         except (json.JSONDecodeError, TypeError):
-            return None
+            matches = [line.strip() for line in value.splitlines() if DID_KEY.fullmatch(line.strip())]
+            return matches[0] if len(matches) == 1 else None
     if isinstance(note, dict):
         for key in ("owner", "owner_did", "did", "value"):
             value = note.get(key)
-            if isinstance(value, str) and value.startswith("did:key:"):
+            if isinstance(value, str) and DID_KEY.fullmatch(value):
                 return value
     return None
 

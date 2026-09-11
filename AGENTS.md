@@ -25,7 +25,7 @@ Treat the signed FLOP Labs launch announcement plus its pinned challenge manifes
 
 Pre-launch development may use candidate official commit:
 
-`624fe936212e865b128047c5c4c1c21bfa80454b`
+`e1999094c359ef7390bdf07fe2a151393a5c2f51`
 
 but do not silently promote that draft to trusted live rules.
 

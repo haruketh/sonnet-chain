@@ -9,10 +9,10 @@ from typing import Any
 import httpx
 
 from .cli import emit_or_post, signer_from
-from .config import Config, SARUKU_DID
+from .config import CONTEST_ID, Config, ROOMS, SARUKU_DID
 from .decision import TeamDecision, deterministic_team_decision
 from .discovery import TeamCandidate, normalize_llm_candidates, parse_protocol_candidate
-from .launch import TrustedLaunch, verify_launch_record
+from .launch import TrustedLaunch, owner_did, verify_launch_record
 from .llm import DISCOVERY_SCHEMA, LLMClient, LLMUnavailable, RECEIPT_SCHEMA, TEAM_SCHEMA, WORDS_SCHEMA
 from .official import sha256, verify_package
 from .poetry import PoemState, build_word_index, validate_candidate
@@ -22,11 +22,6 @@ from .receipts import normalize_llm_receipt, receipt_candidate, receipt_matches
 from .signing import verify_room_signature
 from .state import Phase, StateStore
 from .technocore import Technocore
-
-REGISTRATION_ROOM = "mb-sonnet-1-registration"
-DISCOVERY_ROOM = "mb-sonnet-1-discovery"
-SUBMISSIONS_ROOM = "mb-sonnet-1-submissions"
-
 
 def before_deadline(store: StateStore) -> bool:
     value = store.get("deadline")
@@ -76,7 +71,7 @@ class Daemon:
         if sha256(manifest) != launch.manifest_sha256:
             raise RuntimeError("launch manifest hash does not match downloaded official package")
         contest = verify_package(self.cfg.official_dir, self.cfg.official_commit, launch.manifest_sha256)
-        if contest.get("contest_id") != "sonnet-1":
+        if contest.get("contest_id") != CONTEST_ID:
             raise RuntimeError("official contest_id mismatch")
         for key, expected in launch.contest.items():
             if key in {"contest_id", "opening", "deadline", "rules_version"} and contest.get(key) != expected:
@@ -87,8 +82,9 @@ class Daemon:
         return contest
 
     def _wait_launch(self) -> None:
-        owner = self.tc.owner_note(self.cfg.rules_room)
+        owner = owner_did(self.tc.owner_note(self.cfg.rules_room))
         self._read(self.cfg.rules_room)
+        self.state.set("last_error", None)
         if owner is None:
             self.state.set("rules_owner", None)
             return
@@ -123,7 +119,7 @@ class Daemon:
         signer_from(self.cfg)
         if pending is None:
             self.state.reserve_request(payload["request_id"], "register", payload)
-        self._post(REGISTRATION_ROOM, payload)
+        self._post(ROOMS.registration, payload)
         self.state.phase = Phase.WAIT_REGISTRATION_RECEIPT
 
     def _receipts(self, room: str) -> None:
@@ -203,10 +199,10 @@ class Daemon:
         self.state.set("discovery_cycles", cycles)
         candidates: dict[str, TeamCandidate] = {}
         natural_messages = []
-        for raw in self._read(DISCOVERY_ROOM):
+        for raw in self._read(ROOMS.discovery):
             sender = raw.get("from")
             if not isinstance(sender, str) or not verify_room_signature(
-                DISCOVERY_ROOM, sender, raw.get("nonce", ""), raw.get("text", ""), raw.get("sig", "")
+                ROOMS.discovery, sender, raw.get("nonce", ""), raw.get("text", ""), raw.get("sig", "")
             ):
                 continue
             candidate = parse_protocol_candidate(raw)
@@ -284,7 +280,7 @@ class Daemon:
             payload = team_request(game_id)
         else:
             payload = {
-                "type": "sonnet.note.v1", "contest_id": "sonnet-1", "game_id": game_id,
+                "type": "sonnet.note.v1", "contest_id": CONTEST_ID, "game_id": game_id,
                 "message": "Saruku offers to join as a writer; awaiting explicit team confirmation.",
                 "request_id": request_id("join"),
             }
@@ -293,11 +289,11 @@ class Daemon:
             return
         if pending is None:
             self.state.reserve_request(payload["request_id"], kind, payload)
-        self._post(DISCOVERY_ROOM, payload)
+        self._post(ROOMS.discovery, payload)
         self.state.phase = Phase.WAIT_TEAM_SETUP
 
     def _wait_team_setup(self) -> None:
-        self._receipts(DISCOVERY_ROOM)
+        self._receipts(ROOMS.discovery)
 
     def _roster_consent(self) -> None:
         from .teams import valid_roster
@@ -310,6 +306,7 @@ class Daemon:
         if not (
             isinstance(members, list) and isinstance(game_id, str)
             and isinstance(poem_room, str) and isinstance(generation, int)
+            and poem_room == ROOMS.team(game_id)
             and valid_roster(members, game_id, poem_room, generation, game_id, poem_room, generation,
                              bool(self.state.get("registered")), self.state.active_team())
             and before_deadline(self.state)
@@ -321,7 +318,7 @@ class Daemon:
             return
         if self.state.pending_request("roster") is None:
             self.state.reserve_request(payload["request_id"], "roster", payload)
-        self._post(DISCOVERY_ROOM, payload)
+        self._post(ROOMS.discovery, payload)
         self.state.phase = Phase.WAIT_ROSTER_READY
 
     def _writing(self) -> None:
@@ -428,7 +425,7 @@ class Daemon:
         )
         if self.state.pending_request("submit") is None:
             self.state.reserve_request(payload["request_id"], "submit", payload)
-        self._post(SUBMISSIONS_ROOM, payload)
+        self._post(ROOMS.submissions, payload)
         self.state.phase = Phase.WAIT_SUBMISSION_RECEIPT
 
     def cycle(self) -> None:
@@ -438,7 +435,7 @@ class Daemon:
         elif phase == Phase.REGISTER:
             self._register()
         elif phase == Phase.WAIT_REGISTRATION_RECEIPT:
-            self._receipts(REGISTRATION_ROOM)
+            self._receipts(ROOMS.registration)
         elif phase in {Phase.DISCOVERY, Phase.SELECT_TEAM}:
             self._discovery()
         elif phase == Phase.NEGOTIATE:
@@ -448,7 +445,7 @@ class Daemon:
         elif phase == Phase.ROSTER_CONSENT:
             self._roster_consent()
         elif phase == Phase.WAIT_ROSTER_READY:
-            self._receipts(DISCOVERY_ROOM)
+            self._receipts(ROOMS.discovery)
         elif phase == Phase.WRITING:
             self._writing()
         elif phase == Phase.POEM_COMPLETE:
@@ -458,7 +455,7 @@ class Daemon:
         elif phase == Phase.SUBMIT:
             self._submit()
         elif phase == Phase.WAIT_SUBMISSION_RECEIPT:
-            self._receipts(SUBMISSIONS_ROOM)
+            self._receipts(ROOMS.submissions)
 
     def run(self, max_cycles: int | None = None) -> int:
         cycles = 0
