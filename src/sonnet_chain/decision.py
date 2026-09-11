@@ -17,7 +17,12 @@ class TeamDecision:
 
 
 def deterministic_team_decision(candidates: list[TeamCandidate], minimum: float = 45) -> TeamDecision:
-    viable = [c for c in candidates if c.open_seats is None or c.open_seats > 0]
+    # Unknown capacity is not evidence that a team is joinable.
+    # Autonomous joins require an explicit positive open_seats claim.
+    viable = [
+        c for c in candidates
+        if isinstance(c.open_seats, int) and c.open_seats > 0
+    ]
     if not viable:
         return TeamDecision("wait", "no viable observed team")
     ranked = sorted(((score_team(c), c) for c in viable), key=lambda x: x[0].score, reverse=True)

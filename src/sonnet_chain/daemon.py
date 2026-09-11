@@ -131,6 +131,24 @@ class Daemon:
             receipt = receipt_candidate(room, raw, referee)
             if receipt is None:
                 continue
+
+            # Ignore referee receipts/notices that do not correspond to one of
+            # this participant's pending requests. This prevents unrelated room
+            # traffic from triggering LLM normalization.
+            request_id = receipt.payload.get("request_id")
+            pending = None
+            if isinstance(request_id, str):
+                row = self.state.db.execute(
+                    "SELECT payload FROM requests WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                pending = json.loads(row["payload"]) if row else None
+                if pending is not None:
+                    pending["request_id"] = request_id
+
+            if pending is None:
+                continue
+
             if receipt.kind == "unknown" and self.cfg.openai_api_key_file is not None:
                 try:
                     normalized = LLMClient(self.cfg.openai_api_key_file, self.cfg.model).structured(
@@ -141,13 +159,6 @@ class Daemon:
                     receipt = normalize_llm_receipt(normalized)
                 except LLMUnavailable as exc:
                     self.state.set("last_error", f"LLMUnavailable: {exc}")
-            request_id = receipt.payload.get("request_id")
-            pending = None
-            if isinstance(request_id, str):
-                row = self.state.db.execute("SELECT payload FROM requests WHERE request_id=?", (request_id,)).fetchone()
-                pending = json.loads(row["payload"]) if row else None
-                if pending is not None:
-                    pending["request_id"] = request_id
             accepted = bool(pending and receipt_matches(receipt, pending))
             with self.state.db:
                 inserted = self.state.db.execute(
@@ -224,8 +235,9 @@ class Daemon:
                 for candidate in normalize_llm_candidates(extracted.get("candidates"), natural_messages):
                     candidates[candidate.game_id] = candidate
             except LLMUnavailable as exc:
-                self.state.set("last_error", f"LLMUnavailable: {exc}")
-                return
+                # Natural-language discovery is supplemental. Authenticated
+                # protocol candidates already parsed above remain usable.
+                self.state.set("last_error", f"Discovery extraction unavailable: {exc}")
         if not candidates:
             rows = self.state.db.execute("SELECT payload FROM teams").fetchall()
             candidates = {x.game_id: x for x in (TeamCandidate(**json.loads(r["payload"])) for r in rows)}
