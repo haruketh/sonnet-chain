@@ -90,7 +90,7 @@ Launch:
 
 Contest:
 
-`REGISTER_PENDING -> REGISTERED -> DISCOVERY -> TEAM_NEGOTIATION -> ROOM_ALLOCATED -> ROSTER_CONSENT -> ROSTER_READY -> WRITING -> FROZEN_POEM -> PUBLICATION -> SUBMISSION_PENDING -> SUBMITTED`
+`REGISTER_PENDING -> REGISTERED -> DISCOVERY -> WAIT_ROSTER_READY -> WRITING -> FROZEN_POEM -> PUBLICATION -> SUBMISSION_PENDING -> SUBMITTED`
 
 Errors remain explicit; a post is never promoted to accepted state without a trusted referee receipt.
 
@@ -106,7 +106,13 @@ Target 4–6 members initially, never exceed 8.
 
 The official protocol does not impose an ordering or timer. Therefore the participant should not create artificial skip/drop semantics.
 
-Recruitment is carried out in the official discovery room with signed recorded discussion. Autonomous negotiation should only be enabled after observing the live registration/team receipts, because those receipt shapes are not fully frozen in the public draft.
+Recruitment is observed in the official discovery room, but natural-language
+discussion is not a membership signal. Saruku advertises availability once and
+then waits until all other members have signed the exact same ordered
+`sonnet.roster.v1`. Before signing last, the runtime verifies the referee-owned
+team room, its generation, and the absence of an accepted word. Generic referee
+roster receipts are matched only to Saruku's pending request and never normalized
+by the LLM.
 
 ## 9. Writing strategy
 

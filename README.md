@@ -109,14 +109,24 @@ Long-poll watches retain their last delivered cursor across read timeouts,
 transport interruptions, and transient HTTP 5xx responses, using bounded
 exponential backoff before resuming.
 
-The full phase chain is:
+The active team-formation phase chain is:
 
 ```text
 WAIT_LAUNCH -> VERIFY_LAUNCH -> REGISTER -> WAIT_REGISTRATION_RECEIPT
--> DISCOVERY -> SELECT_TEAM -> NEGOTIATE -> WAIT_TEAM_SETUP
--> ROSTER_CONSENT -> WAIT_ROSTER_READY -> WRITING -> POEM_COMPLETE
+-> DISCOVERY -> WAIT_ROSTER_READY -> WRITING -> POEM_COMPLETE
 -> PUBLISH_IF_FINAL_CONTRIBUTOR -> SUBMIT -> WAIT_SUBMISSION_RECEIPT -> DONE
 ```
+
+In discovery, Saruku first advertises availability once. It never joins from a
+score, seat offer, natural-language invitation, or `sonnet.note.v1`. It signs a
+roster only after every other listed member has signed the same ordered roster,
+the referee owns the matching team room, its generation matches, and no accepted
+word has frozen that room. Membership decisions do not call the LLM.
+
+Production generic `sonnet.receipt.v1` roster receipts are joined to Saruku's
+local pending request by `request_id`. A true `roster_ready` value initializes
+the team, ordered members, room generation, and poem state hash from that trusted
+local request plus the referee receipt.
 
 Unknown receipt shapes do not advance this chain. Only a locally verified
 signature from the pinned referee DID can become a receipt candidate, and its

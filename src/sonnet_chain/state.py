@@ -68,6 +68,8 @@ class StateStore:
             "referee_did": None,
             "manifest_sha256": None,
             "registered": False,
+            "discovery_advertised": False,
+            "discovery_advertisement_attempted": False,
             "candidate_teams": [],
             "active_team": None,
             "current_roster": [],

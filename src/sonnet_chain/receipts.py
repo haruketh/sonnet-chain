@@ -4,11 +4,12 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .config import CONTEST_ID, ROOMS
+from .config import CONTEST_ID, ROOMS, SARUKU_DID
 from .signing import verify_room_signature
 
 ReceiptKind = Literal[
-    "registration_accepted", "registration_rejected", "team_setup", "roster_ready",
+    "registration_accepted", "registration_rejected", "team_setup", "roster_consent_accepted",
+    "roster_ready", "roster_rejected",
     "word_accepted", "word_rejected", "submission_accepted", "submission_rejected", "unknown",
 ]
 KNOWN = {
@@ -70,6 +71,23 @@ def receipt_candidate(room: str, raw: dict, referee_did: str) -> NormalizedRecei
             if valid_registration and status == "rejected":
                 return NormalizedReceipt("registration_rejected", payload)
 
+        if room == ROOMS.discovery:
+            valid_roster_receipt = (
+                isinstance(payload.get("request_id"), str)
+                and bool(payload["request_id"])
+                and isinstance(payload.get("sender_did"), str)
+                and isinstance(payload.get("state_hash"), str)
+                and bool(payload["state_hash"])
+                and isinstance(payload.get("roster_ready"), bool)
+            )
+            if valid_roster_receipt and payload.get("status") == "accepted":
+                return NormalizedReceipt(
+                    "roster_ready" if payload["roster_ready"] else "roster_consent_accepted",
+                    payload,
+                )
+            if valid_roster_receipt and payload.get("status") == "rejected":
+                return NormalizedReceipt("roster_rejected", payload)
+
         return NormalizedReceipt("unknown", payload)
 
     return NormalizedReceipt(KNOWN.get(payload.get("type"), "unknown"), payload)
@@ -78,6 +96,13 @@ def receipt_candidate(room: str, raw: dict, referee_did: str) -> NormalizedRecei
 def receipt_matches(receipt: NormalizedReceipt, pending: dict[str, Any]) -> bool:
     if receipt.kind == "unknown":
         return False
+    if receipt.kind in {"roster_consent_accepted", "roster_ready", "roster_rejected"}:
+        return (
+            pending.get("type") == "sonnet.roster.v1"
+            and receipt.payload.get("contest_id") == CONTEST_ID
+            and receipt.payload.get("request_id") == pending.get("request_id")
+            and receipt.payload.get("sender_did") == SARUKU_DID
+        )
     for key in ("request_id", "game_id", "room_generation", "poem_room", "previous_state_hash"):
         if key in pending and receipt.payload.get(key) != pending[key]:
             return False
@@ -96,7 +121,9 @@ def normalize_llm_receipt(value: Any) -> NormalizedReceipt:
         "registration_accepted": {"request_id"},
         "registration_rejected": {"request_id"},
         "team_setup": {"request_id", "game_id", "poem_room", "room_generation"},
+        "roster_consent_accepted": {"request_id"},
         "roster_ready": {"request_id", "game_id", "poem_room", "room_generation", "members"},
+        "roster_rejected": {"request_id"},
         "word_accepted": {"request_id", "game_id", "room_generation", "request_version", "version", "state_hash", "contributor_did"},
         "word_rejected": {"request_id", "game_id", "room_generation", "request_version"},
         "submission_accepted": {"request_id", "game_id"},

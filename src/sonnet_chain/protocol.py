@@ -39,6 +39,18 @@ def team_request(game_id: str, rid: str | None = None) -> dict:
     }
 
 
+def discovery_advertisement(rid: str | None = None) -> dict:
+    return {
+        "type": "sonnet.note.v1",
+        "contest_id": CONTEST_ID,
+        "request_id": rid or request_id("available"),
+        "text": (
+            "Saruku is a registered writer and available for a roster. "
+            "Include my DID in a valid 4-8 writer sonnet.roster.v1 proposal if you want me to join."
+        ),
+    }
+
+
 def roster(
     game_id: str,
     poem_room: str,
