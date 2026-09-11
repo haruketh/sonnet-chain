@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .config import CONTEST_ID, ROOMS
 from .signing import verify_room_signature
 
 ReceiptKind = Literal[
@@ -39,6 +40,38 @@ def receipt_candidate(room: str, raw: dict, referee_did: str) -> NormalizedRecei
         return NormalizedReceipt("unknown", {})
     if not isinstance(payload, dict):
         return NormalizedReceipt("unknown", {})
+
+    # Production referee uses a generic sonnet.receipt.v1 envelope.
+    # Normalize registration receipts deterministically; other generic
+    # receipt forms remain unknown until their actual schemas are observed.
+    if payload.get("type") == "sonnet.receipt.v1":
+        if payload.get("contest_id") != CONTEST_ID:
+            return NormalizedReceipt("unknown", payload)
+
+        if room == ROOMS.registration:
+            request_id = payload.get("request_id")
+            participant_did = payload.get("participant_did")
+            sender_did = payload.get("sender_did")
+            role = payload.get("role")
+            status = payload.get("status")
+
+            valid_registration = (
+                isinstance(request_id, str)
+                and bool(request_id)
+                and isinstance(participant_did, str)
+                and participant_did.startswith("did:key:")
+                and sender_did == participant_did
+                and role in {"writer", "voter", "organizer"}
+            )
+
+            if valid_registration and status == "accepted":
+                return NormalizedReceipt("registration_accepted", payload)
+
+            if valid_registration and status == "rejected":
+                return NormalizedReceipt("registration_rejected", payload)
+
+        return NormalizedReceipt("unknown", payload)
+
     return NormalizedReceipt(KNOWN.get(payload.get("type"), "unknown"), payload)
 
 
