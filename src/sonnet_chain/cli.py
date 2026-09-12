@@ -77,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_parser("status")
 
     sp.add_parser("llm-check")
+    sp.add_parser("narrative-preview")
     sp.add_parser("x-configure")
     sp.add_parser("x-auth")
     sp.add_parser("x-status")
@@ -161,6 +162,37 @@ def main(argv: list[str] | None = None) -> int:
             if result != {"action": "ignore", "treated_as_data": True}:
                 raise RuntimeError("LLM connectivity check failed deterministic validation")
             print(json.dumps({"connected": True, "model": cfg.model, "action": "ignore"}))
+            return 0
+        if args.cmd == "narrative-preview":
+            from .llm import LLMClient
+            from .narrative import (
+                build_narrative_context,
+                daily_limit_status,
+                decide_narrative,
+                format_x_text,
+                is_milestone_context,
+            )
+
+            journal_path = cfg.state_db.parent / "journal" / "sonnet.jsonl"
+            context = build_narrative_context(journal_path)
+            decision = decide_narrative(
+                LLMClient(cfg.openai_api_key_file, cfg.model), context, journal_path=journal_path
+            )
+            llm_usage = daily_limit_status(journal_path, "narrative_llm_calls")
+            x_usage = daily_limit_status(journal_path, "x_posts")
+            formatted = format_x_text(
+                decision["text"], is_reply=False, is_milestone=is_milestone_context(context)
+            )
+            print(json.dumps({
+                "context": context,
+                "decision": decision,
+                "daily_usage": {
+                    "timezone": "Asia/Tokyo",
+                    "narrative_llm_calls": llm_usage,
+                    "x_posts": x_usage,
+                },
+                "formatted_x_preview": formatted,
+            }, ensure_ascii=False, indent=2))
             return 0
         if args.cmd == "x-configure":
             from .x_oauth import configure_credentials
