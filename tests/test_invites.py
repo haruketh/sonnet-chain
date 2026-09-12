@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from sonnet_chain.config import CONTEST_ID, Config, ROOMS, SARUKU_DID
 from sonnet_chain.daemon import Daemon
-from sonnet_chain.invites import direct_invite
+from sonnet_chain.invites import application_should_expire, direct_invite, pending_application
 from sonnet_chain.journal import Journal
 from sonnet_chain.protocol import team_application
 from sonnet_chain.signing import Signer, did_of
@@ -31,6 +32,9 @@ def _invite(
     target: str = SARUKU_DID,
     game_id: str | None = "deftink",
     kind: str = "sonnet.note.v1",
+    seq: int = 1,
+    created_at: str | None = None,
+    with_room: bool = False,
 ) -> dict:
     payload = {
         "type": kind,
@@ -40,7 +44,13 @@ def _invite(
     }
     if game_id is not None:
         payload["game_id"] = game_id
-    return _signed(key, payload)
+        if with_room:
+            payload["poem_room"] = ROOMS.team(game_id)
+            payload["room_generation"] = 3
+    record = _signed(key, payload, seq)
+    if created_at is not None:
+        record["created_at"] = created_at
+    return record
 
 
 def _daemon(tmp_path: Path) -> Daemon:
@@ -59,6 +69,47 @@ def _daemon(tmp_path: Path) -> Daemon:
     daemon.journal = Journal(tmp_path / "journal" / "sonnet.jsonl")
     daemon._read = lambda room: []
     return daemon
+
+
+def _record_application(daemon: Daemon, game_id: str, age_minutes: int) -> None:
+    daemon.journal.path.parent.mkdir(parents=True, exist_ok=True)
+    sent_at = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    daemon.journal.path.write_text(json.dumps({
+        "ts": sent_at.isoformat().replace("+00:00", "Z"),
+        "event": "team_application_sent",
+        "game_id": game_id,
+        "target_from_did": "did:key:zLead",
+        "request_id": f"application-{game_id}",
+    }) + "\n", encoding="utf-8")
+
+
+def _ready_roster(daemon: Daemon, game_id: str) -> None:
+    keys = [Ed25519PrivateKey.generate() for _ in range(3)]
+    members = [did_of(key) for key in keys] + [SARUKU_DID]
+    payload = {
+        "type": "sonnet.roster.v1",
+        "contest_id": CONTEST_ID,
+        "game_id": game_id,
+        "poem_room": ROOMS.team(game_id),
+        "room_generation": 3,
+        "members": members,
+        "request_id": "roster",
+    }
+    for seq, key in enumerate(keys, 1):
+        daemon.state.record_event(ROOMS.discovery, seq, 1, _signed(key, payload, seq))
+
+
+def _team_room(daemon: Daemon):
+    referee = daemon.state.get("referee_did")
+
+    class TeamRoom:
+        def owner_note(self, room):
+            return referee
+
+        def read_page(self, room, since, wait):
+            return [], 3
+
+    return TeamRoom()
 
 
 @pytest.mark.parametrize("kind", ["sonnet.note.v1", "sonnet.invite.v1", "sonnet.invite.v2"])
@@ -159,5 +210,192 @@ def test_application_posts_once_and_stays_in_discovery(tmp_path: Path) -> None:
         assert records["event"] == "team_application_sent"
         assert records["game_id"] == "deftink"
         assert records["target_from_did"] == did_of(inviter)
+    finally:
+        daemon.state.close()
+
+
+def test_multiple_invites_select_only_newest_candidate(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    daemon.state.record_event(
+        ROOMS.discovery, 1, 1,
+        _invite(Ed25519PrivateKey.generate(), game_id="older", seq=1,
+                created_at="2026-01-01T00:00:00Z"),
+    )
+    daemon.state.record_event(
+        ROOMS.discovery, 2, 1,
+        _invite(Ed25519PrivateKey.generate(), game_id="newer", seq=2,
+                created_at="2026-01-01T00:01:00Z"),
+    )
+    posted = []
+    daemon._post = lambda room, payload: posted.append(payload)
+    daemon.live = True
+    try:
+        daemon._discovery()
+        assert len(posted) == 1
+        assert posted[0]["game_id"] == "newer"
+    finally:
+        daemon.state.close()
+
+
+def test_verified_room_outranks_newer_unverified_invite(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    referee = daemon.state.get("referee_did")
+    daemon.state.record_event(
+        ROOMS.discovery, 1, 1,
+        _invite(Ed25519PrivateKey.generate(), game_id="verified", seq=1,
+                created_at="2026-01-01T00:00:00Z", with_room=True),
+    )
+    daemon.state.record_event(
+        ROOMS.discovery, 2, 1,
+        _invite(Ed25519PrivateKey.generate(), game_id="newer", seq=2,
+                created_at="2026-01-01T00:01:00Z"),
+    )
+
+    class TeamRoom:
+        def owner_note(self, room):
+            return referee
+
+        def read_page(self, room, since, wait):
+            return [], 3
+
+    daemon.tc = TeamRoom()
+    posted = []
+    daemon._post = lambda room, payload: posted.append(payload)
+    daemon.live = True
+    try:
+        daemon._discovery()
+        assert len(posted) == 1
+        assert posted[0]["game_id"] == "verified"
+    finally:
+        daemon.state.close()
+
+
+def test_pending_application_blocks_another_game(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    daemon.journal.append(
+        "team_application_sent", game_id="hayes", target_from_did="did:key:zLead",
+        request_id="application-hayes",
+    )
+    daemon.state.record_event(
+        ROOMS.discovery, 1, 1,
+        _invite(Ed25519PrivateKey.generate(), game_id="deftink"),
+    )
+    posted = []
+    daemon._post = lambda room, payload: posted.append(payload)
+    daemon.live = True
+    try:
+        daemon._discovery()
+        assert posted == []
+        assert daemon.state.phase == Phase.DISCOVERY
+        assert daemon.state.active_team() is None
+    finally:
+        daemon.state.close()
+
+
+def test_application_under_twenty_minutes_is_pending(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 19)
+    try:
+        pending = pending_application(daemon.journal.path)
+        assert pending is not None
+        assert pending.game_id == "hayes"
+        assert not application_should_expire(
+            pending,
+            now=datetime.now(timezone.utc),
+            active_team=None,
+            signed_games=set(),
+            progressed_games=set(),
+        )
+    finally:
+        daemon.state.close()
+
+
+def test_stale_application_expires_once(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 21)
+    daemon.live = True
+    daemon._post = lambda room, payload: None
+    try:
+        daemon._discovery()
+        daemon._discovery()
+        records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
+        expiries = [record for record in records if record["event"] == "team_application_expired"]
+        assert len(expiries) == 1
+        assert expiries[0]["game_id"] == "hayes"
+        assert expiries[0]["request_id"] == "application-hayes"
+        assert pending_application(daemon.journal.path) is None
+    finally:
+        daemon.state.close()
+
+
+def test_expired_application_allows_next_game_on_next_cycle(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 21)
+    daemon.state.record_event(
+        ROOMS.discovery, 1, 1,
+        _invite(Ed25519PrivateKey.generate(), game_id="deftink"),
+    )
+    posted = []
+    daemon._post = lambda room, payload: posted.append(payload)
+    daemon.live = True
+    try:
+        daemon._discovery()
+        assert posted == []
+        daemon._discovery()
+        assert len(posted) == 1
+        assert posted[0]["type"] == "sonnet.application.v1"
+        assert posted[0]["game_id"] == "deftink"
+    finally:
+        daemon.state.close()
+
+
+def test_pending_application_rejects_other_game_roster(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 5)
+    _ready_roster(daemon, "deftink")
+    daemon.tc = _team_room(daemon)
+    posted = []
+    daemon._post = lambda room, payload: posted.append(payload)
+    daemon.live = True
+    try:
+        daemon._discovery()
+        assert posted == []
+        assert daemon.state.active_team() is None
+        assert daemon.state.phase == Phase.DISCOVERY
+    finally:
+        daemon.state.close()
+
+
+def test_pending_application_allows_matching_safe_roster(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 5)
+    _ready_roster(daemon, "hayes")
+    daemon.tc = _team_room(daemon)
+    posted = []
+    daemon._post = lambda room, payload: posted.append(payload)
+    daemon.live = True
+    try:
+        daemon._discovery()
+        assert len(posted) == 1
+        assert posted[0]["type"] == "sonnet.roster.v1"
+        assert posted[0]["game_id"] == "hayes"
+        assert daemon.state.phase == Phase.WAIT_ROSTER_READY
+    finally:
+        daemon.state.close()
+
+
+def test_expired_application_roster_is_never_signed(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 21)
+    daemon.tc = _team_room(daemon)
+    posted = []
+    daemon._post = lambda room, payload: posted.append(payload)
+    daemon.live = True
+    try:
+        daemon._discovery()
+        _ready_roster(daemon, "hayes")
+        daemon._discovery()
+        assert posted == []
+        assert daemon.state.active_team() is None
     finally:
         daemon.state.close()

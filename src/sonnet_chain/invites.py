@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,6 +19,52 @@ class DirectInvite:
     from_did: str
     poem_room: str | None
     room_generation: int | None
+    explicit_offer_rank: int
+    lead_verified: bool
+    message_time: float
+    seq: int
+
+
+@dataclass(frozen=True)
+class InviteCandidate:
+    invite: DirectInvite
+    room_verified: bool
+
+
+@dataclass
+class PendingApplication:
+    game_id: str
+    request_id: str
+    sent_at: datetime | None
+    progressed: bool = False
+
+
+def _message_time(record: dict[str, Any]) -> float:
+    value = record.get("created_at", record.get("timestamp", record.get("ts")))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return float("-inf")
+
+
+def choose_invite(candidates: Iterable[InviteCandidate]) -> DirectInvite | None:
+    choices = list(candidates)
+    if not choices:
+        return None
+    return max(
+        choices,
+        key=lambda item: (
+            item.room_verified,
+            item.invite.explicit_offer_rank,
+            item.invite.lead_verified,
+            item.invite.message_time,
+            item.invite.seq,
+        ),
+    ).invite
 
 
 def direct_invite(
@@ -60,7 +107,16 @@ def direct_invite(
             return None
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
             return None
-    return DirectInvite(game_id, sender, poem_room, generation)
+    try:
+        seq = int(record.get("seq", 0) or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    lead = payload.get("team_lead_did", payload.get("lead_did"))
+    explicit_offer_rank = 2 if payload["type"] in {"sonnet.invite.v1", "sonnet.invite.v2"} else 1
+    return DirectInvite(
+        game_id, sender, poem_room, generation, explicit_offer_rank,
+        isinstance(lead, str) and lead == sender, _message_time(record), seq,
+    )
 
 
 def invite_room_is_open(
@@ -118,3 +174,99 @@ def application_was_sent(journal_path: Path, game_id: str) -> bool:
         ):
             return True
     return False
+
+
+def pending_application(journal_path: Path) -> PendingApplication | None:
+    try:
+        lines = journal_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return PendingApplication("unknown", "unknown", None)
+    pending = None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return PendingApplication("unknown", "unknown", None)
+        if not isinstance(record, dict):
+            continue
+        game_id = record.get("game_id")
+        request_id = record.get("request_id")
+        if (
+            record.get("event") == "team_application_sent"
+            and isinstance(game_id, str)
+            and isinstance(request_id, str)
+        ):
+            try:
+                sent_at = datetime.fromisoformat(str(record.get("ts", "")).replace("Z", "+00:00"))
+                sent_at = sent_at.astimezone(timezone.utc) if sent_at.tzinfo else None
+            except ValueError:
+                sent_at = None
+            pending = PendingApplication(game_id, request_id, sent_at)
+            continue
+        if pending is None or game_id != pending.game_id:
+            continue
+        if record.get("event") in {"team_application_accepted", "team_application_progressed"}:
+            pending.progressed = True
+            continue
+        ended = (
+            record.get("event") in {"team_application_ended", "team_application_expired"}
+            or (
+                record.get("event") == "receipt_accepted"
+                and record.get("kind") in {"roster_ready", "roster_rejected"}
+            )
+            or (
+                record.get("event") == "technocore_post_succeeded"
+                and record.get("type") in {"sonnet.roster.v1", "sonnet.withdraw.v1"}
+            )
+        )
+        if ended:
+            pending = None
+    return pending
+
+
+def pending_application_game(journal_path: Path) -> str | None:
+    pending = pending_application(journal_path)
+    return pending.game_id if pending is not None else None
+
+
+def application_should_expire(
+    pending: PendingApplication,
+    *,
+    now: datetime,
+    active_team: str | None,
+    signed_games: set[str],
+    progressed_games: set[str],
+) -> bool:
+    if now.tzinfo is None:
+        raise ValueError("now must include a timezone")
+    if (
+        pending.sent_at is None
+        or pending.progressed
+        or active_team is not None
+        or pending.game_id in signed_games
+        or pending.game_id in progressed_games
+    ):
+        return False
+    return (now.astimezone(timezone.utc) - pending.sent_at).total_seconds() >= 20 * 60
+
+
+def expired_application_games(journal_path: Path) -> set[str]:
+    try:
+        lines = journal_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    games = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(record, dict)
+            and record.get("event") == "team_application_expired"
+            and isinstance(record.get("game_id"), str)
+        ):
+            games.add(record["game_id"])
+    return games

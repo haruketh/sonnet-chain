@@ -12,7 +12,16 @@ from .cli import emit_or_post, signer_from
 from .config import CONTEST_ID, Config, ROOMS, SARUKU_DID
 from .launch import TrustedLaunch, owner_did, verify_launch_record
 from .journal import Journal
-from .invites import application_was_sent, direct_invite, invite_room_is_open
+from .invites import (
+    InviteCandidate,
+    application_should_expire,
+    application_was_sent,
+    choose_invite,
+    direct_invite,
+    expired_application_games,
+    invite_room_is_open,
+    pending_application,
+)
 from .llm import LLMClient, LLMUnavailable, RECEIPT_SCHEMA, WORDS_SCHEMA
 from .official import sha256, verify_package
 from .poetry import PoemState, build_word_index, validate_candidate
@@ -264,6 +273,7 @@ class Daemon:
         if not self.state.get("registered") or not before_deadline(self.state):
             return
         if self.state.active_team() is None and self.cfg.x_account_url:
+            journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
             _, discovery_generation = self.state.cursor(ROOMS.discovery)
             discovery_events = [
                 event for event in self.state.events(ROOMS.discovery)
@@ -274,40 +284,65 @@ class Daemon:
                 for parsed in (signed_roster(item) for item in discovery_events)
                 if parsed is not None and parsed[1] == SARUKU_DID
             }
-            for event in discovery_events:
-                invite = direct_invite(event)
-                if invite is None:
-                    continue
-                journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
-                if (
-                    invite.game_id in signed_games
-                    or application_was_sent(journal_path, invite.game_id)
-                    or self.state.pending_request(f"application:{invite.game_id}") is not None
-                ):
-                    continue
-                if invite.poem_room is not None:
-                    referee = self.state.get("referee_did")
-                    if not isinstance(referee, str):
-                        continue
-                    owner = self.tc.owner_note(invite.poem_room)
-                    records, generation = self.tc.read_page(invite.poem_room, 0, 0)
-                    if not invite_room_is_open(invite, referee, owner, generation, records):
-                        continue
-                payload = team_application(invite.game_id, self.cfg.x_account_url)
-                if not self.live:
-                    self.state.set("dry_run_action", payload)
-                    return
-                self.state.reserve_request(
-                    payload["request_id"], f"application:{invite.game_id}", payload
-                )
-                self._post(ROOMS.discovery, payload)
+            roster_games = {
+                parsed[0].game_id
+                for parsed in (signed_roster(item) for item in discovery_events)
+                if parsed is not None and SARUKU_DID in parsed[0].members
+            }
+            pending_app = pending_application(journal_path)
+            if pending_app is not None and application_should_expire(
+                pending_app,
+                now=datetime.now(timezone.utc),
+                active_team=self.state.active_team(),
+                signed_games=signed_games,
+                progressed_games=roster_games,
+            ):
                 self._journal(
-                    "team_application_sent",
-                    game_id=invite.game_id,
-                    target_from_did=invite.from_did,
-                    request_id=payload["request_id"],
+                    "team_application_expired",
+                    game_id=pending_app.game_id,
+                    request_id=pending_app.request_id,
                 )
                 return
+            if pending_app is None:
+                candidates = []
+                for event in discovery_events:
+                    invite = direct_invite(event)
+                    if invite is None:
+                        continue
+                    if (
+                        invite.game_id in signed_games
+                        or application_was_sent(journal_path, invite.game_id)
+                        or self.state.pending_request(f"application:{invite.game_id}") is not None
+                    ):
+                        continue
+                    room_verified = False
+                    if invite.poem_room is not None:
+                        referee = self.state.get("referee_did")
+                        if not isinstance(referee, str):
+                            continue
+                        owner = self.tc.owner_note(invite.poem_room)
+                        records, generation = self.tc.read_page(invite.poem_room, 0, 0)
+                        if not invite_room_is_open(invite, referee, owner, generation, records):
+                            continue
+                        room_verified = True
+                    candidates.append(InviteCandidate(invite, room_verified))
+                selected = choose_invite(candidates)
+                if selected is not None:
+                    payload = team_application(selected.game_id, self.cfg.x_account_url)
+                    if not self.live:
+                        self.state.set("dry_run_action", payload)
+                        return
+                    self.state.reserve_request(
+                        payload["request_id"], f"application:{selected.game_id}", payload
+                    )
+                    self._post(ROOMS.discovery, payload)
+                    self._journal(
+                        "team_application_sent",
+                        game_id=selected.game_id,
+                        target_from_did=selected.from_did,
+                        request_id=payload["request_id"],
+                    )
+                    return
         if not self.state.get("discovery_advertised"):
             if self.state.get("discovery_advertisement_attempted"):
                 self.state.set("last_error", "Discovery advertisement outcome is ambiguous; refusing a duplicate")
@@ -323,8 +358,8 @@ class Daemon:
             self.state.set("discovery_advertised", True)
             self.state.set("last_error", None)
             return
-        pending = self.state.pending_request("roster")
-        if pending is not None:
+        pending_roster = self.state.pending_request("roster")
+        if pending_roster is not None:
             self.state.phase = Phase.WAIT_ROSTER_READY
             return
         if self.state.active_team() is not None:
@@ -337,8 +372,15 @@ class Daemon:
             event for event in self.state.events(ROOMS.discovery)
             if event.get("_room_generation") == discovery_generation
         ]
+        journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
+        pending_game = pending_application(journal_path)
+        expired_games = expired_application_games(journal_path)
         for consensus in roster_consensus(discovery_events):
             proposal = consensus.roster
+            if pending_game is not None and proposal.game_id != pending_game.game_id:
+                continue
+            if proposal.game_id in expired_games:
+                continue
             owner = self.tc.owner_note(proposal.poem_room)
             records, generation = self.tc.read_page(proposal.poem_room, 0, 0)
             if not team_room_is_open(proposal, referee, owner, generation, records):
