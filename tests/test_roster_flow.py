@@ -205,6 +205,11 @@ def test_own_generic_roster_ready_uses_pending_context(tmp_path: Path):
         assert daemon.state.get("poem_room") == payload["poem_room"]
         assert daemon.state.get("room_generation") == payload["room_generation"]
         assert daemon.state.get("poem_state_hash") == "initial-state"
+        progress_at = daemon.state.get("poem_last_progress_at")
+        assert isinstance(progress_at, str)
+        daemon.state.close()
+        daemon.state = StateStore(tmp_path / "state.db")
+        assert daemon.state.get("poem_last_progress_at") == progress_at
     finally:
         daemon.state.close()
 

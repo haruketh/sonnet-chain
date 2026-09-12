@@ -46,12 +46,15 @@ TEAM_MESSAGE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "proposal_type": {"type": "string"},
+                    "proposal_mode": {"type": "string", "enum": [
+                        "SELF_COMMITMENT", "NOMINATION", "REQUEST", "PREFERENCE"
+                    ]},
                     "target_text": {"type": ["string", "null"]},
                     "value": {"type": ["string", "number", "boolean", "null"]},
                     "scope": {"type": "string", "enum": ["next_word", "current_line", "poem"]},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 },
-                "required": ["proposal_type", "target_text", "value", "scope", "confidence"],
+                "required": ["proposal_type", "proposal_mode", "target_text", "value", "scope", "confidence"],
                 "additionalProperties": False,
             },
         },
@@ -238,7 +241,7 @@ class TeamIntelligence:
             raise ValueError("invalid unclassified items")
         required = {
             "claims": {"predicate", "value", "scope", "confidence"},
-            "proposals": {"proposal_type", "target_text", "value", "scope", "confidence"},
+            "proposals": {"proposal_type", "proposal_mode", "target_text", "value", "scope", "confidence"},
             "questions": {"text", "target_text", "confidence"},
             "constraints": {"predicate", "value", "scope", "confidence"},
             "retractions": {"predicate", "scope", "confidence"},
@@ -297,14 +300,18 @@ class TeamIntelligence:
         for item in extracted["proposals"]:
             ordinal += 1
             target_text = item.get("target_text") if isinstance(item.get("target_text"), str) else None
-            resolved = target_text if target_text in members else None
+            mode = item["proposal_mode"]
+            resolved = source.speaker if mode == "SELF_COMMITMENT" else (
+                target_text if target_text in members else None
+            )
             self._append(
                 source, ordinal, "CLAIM", "proposal", actor=source.speaker, subject=resolved,
                 scope=item.get("scope"), predicate=item.get("proposal_type"), value=item.get("value"),
                 target_text=target_text, resolved_target=resolved, method="llm",
                 confidence=float(item.get("confidence", 0)),
                 extra={"observed_at_version": source.poem_version,
-                       "observed_at_line": source.poem_line},
+                       "observed_at_line": source.poem_line,
+                       "proposal_mode": mode},
             )
         for group, event_type in (("questions", "question"), ("constraints", "constraint"),
                                   ("retractions", "retraction")):
@@ -541,6 +548,7 @@ class TeamIntelligence:
                     "target_text": row["target_text"],
                     "resolved_target_did": row["resolved_target_did"],
                     "proposal_type": row["predicate"], "scope": row["scope"],
+                    "proposal_mode": row["payload"]["semantic"].get("proposal_mode", "PREFERENCE"),
                     "value": row["value"],
                     "observed_at_version": row["source_poem_version"],
                     "observed_at_line": row["payload"]["source"].get(

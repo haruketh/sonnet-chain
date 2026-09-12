@@ -107,6 +107,7 @@ class StateStore:
             "poem_room": None,
             "poem_version": 0,
             "poem_state_hash": None,
+            "poem_last_progress_at": None,
             "accepted_contributions": [],
             "previous_contributor": None,
             "final_contributor": None,

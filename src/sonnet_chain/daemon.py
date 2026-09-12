@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import asdict
@@ -10,6 +11,10 @@ import httpx
 
 from .cli import emit_or_post, signer_from
 from .config import CONTEST_ID, Config, ROOMS, SARUKU_DID
+from .decision import (
+    Action, build_decision_state, coordination_key, coordination_text, decide,
+    qualification_preserved, validate_decision,
+)
 from .launch import TrustedLaunch, owner_did, verify_launch_record
 from .journal import Journal
 from .invites import (
@@ -244,6 +249,7 @@ class Daemon:
                 })
                 self.state.set("poem_version", 0)
                 self.state.set("poem_state_hash", state_hash)
+                self.state.set("poem_last_progress_at", datetime.now(timezone.utc).isoformat())
                 self.state.set("roster_ready", True)
                 self._clear_roster_wait_state()
                 self.state.phase = Phase.WRITING
@@ -254,12 +260,16 @@ class Daemon:
                 self._clear_roster_wait_state()
                 self.state.phase = Phase.DISCOVERY
             elif receipt.kind == "word_accepted":
+                old_version = int(self.state.get("poem_version", 0) or 0)
                 self.state.set_request_status(request_id, "accepted")
                 self.state.set("poem_version", receipt.payload.get("version"))
                 self.state.set("poem_state_hash", receipt.payload.get("state_hash"))
                 self.state.set("previous_contributor", receipt.payload.get("contributor_did"))
                 if isinstance(receipt.payload.get("lines"), list):
                     self.state.set("poem_lines", receipt.payload["lines"])
+                new_version = receipt.payload.get("version")
+                if isinstance(new_version, int) and new_version > old_version:
+                    self.state.set("poem_last_progress_at", datetime.now(timezone.utc).isoformat())
                 if receipt.payload.get("complete") is True:
                     self.state.set("final_contributor", receipt.payload.get("contributor_did"))
                     self.state.phase = Phase.POEM_COMPLETE
@@ -690,13 +700,17 @@ class Daemon:
             return
         if self._ensure_team_intro(poem_room, game_id):
             return
+        snapshot = None
+        decision_llm = (
+            LLMClient(self.cfg.openai_api_key_file, self.cfg.model)
+            if self.cfg.openai_api_key_file is not None else None
+        )
         try:
             intelligence = TeamIntelligence(
                 self.state,
-                LLMClient(self.cfg.openai_api_key_file, self.cfg.model)
-                if self.cfg.openai_api_key_file is not None else None,
+                decision_llm,
             )
-            intelligence.sync(
+            snapshot = intelligence.sync(
                 game_id, poem_room, generation, self.state.get("current_roster", []),
                 self.state.get("referee_did"),
                 int(self.state.get("line_number", 1) or 1),
@@ -704,6 +718,38 @@ class Daemon:
         except Exception as exc:
             # Team understanding is observational; failure must not block the legacy writer.
             self.state.set("last_team_intelligence_error", type(exc).__name__)
+            try:
+                snapshot = TeamIntelligence(self.state).rebuild_snapshot(
+                    game_id, poem_room, generation,
+                    int(self.state.get("line_number", 1) or 1),
+                )
+            except Exception:
+                persisted = TeamIntelligence(self.state).load_snapshot(game_id)
+                if (
+                    isinstance(persisted, dict)
+                    and persisted.get("room") == poem_room
+                    and persisted.get("room_generation") == generation
+                ):
+                    snapshot = persisted
+                else:
+                    roster = self.state.get("current_roster", [])
+                    snapshot = {
+                        "game_id": game_id, "room": poem_room,
+                        "room_generation": generation, "current_version": int(
+                            self.state.get("poem_version", 0) or 0
+                        ),
+                        "members": {
+                            did: {"facts": {"roster_member": True,
+                                             "has_contributed": did in self.state.get(
+                                                 "accepted_contributions", []
+                                             )}}
+                            for did in roster if isinstance(did, str)
+                        },
+                        "active_proposals": [], "terminal_risks": [], "questions": [],
+                        "ledger_high_watermark": "minimal-safe-context",
+                    }
+        if snapshot is None:
+            return
         current = PoemState(
             version=int(self.state.get("poem_version", 0) or 0),
             state_hash=self.state.get("poem_state_hash") or "",
@@ -712,15 +758,84 @@ class Daemon:
             line_number=int(self.state.get("line_number", 1) or 1),
             previous_contributor=self.state.get("previous_contributor"),
         )
-        if current.previous_contributor == SARUKU_DID or not current.state_hash:
-            return
         request_kind = f"word:{current.version}"
         pending = self.state.pending_request(request_kind)
+        progress_at = self.state.get("poem_last_progress_at")
+        if not isinstance(progress_at, str):
+            progress_at = datetime.now(timezone.utc).isoformat()
+            self.state.set("poem_last_progress_at", progress_at)
+        sent_keys = {
+            row["kind"].split(":", 1)[1] for row in self.state.db.execute(
+                "SELECT kind FROM requests WHERE kind LIKE 'coordination:%'"
+            )
+        }
+        runtime = {
+            "game_id": game_id, "poem_room": poem_room, "room_generation": generation,
+            "current_version": current.version, "current_state_hash": current.state_hash,
+            "current_line": current.line_number,
+            "current_line_syllables": current.line_syllables,
+            "last_progress_at": progress_at, "previous_contributor": current.previous_contributor,
+            "roster": self.state.get("current_roster", []), "poem_complete": False,
+        }
+        now = datetime.now(timezone.utc)
+        decision_state = build_decision_state(
+            runtime=runtime, snapshot=snapshot, now=now, phase=self.state.phase,
+            deadline_ok=before_deadline(self.state), pending_word=pending is not None,
+            coordination_sent=sent_keys,
+            commitment_waits=self.state.get("self_commitment_waits", {}),
+        )
+        self.state.set("self_commitment_waits", decision_state.commitment_wait_records)
+        decision = decide(decision_state, now, decision_llm)
+        self._journal(
+            "team_decision", game_id=game_id, room_generation=generation,
+            version=current.version, action=decision.action.value,
+            reason_code=decision.reason_code, target_did=decision.target_did,
+            coordination_intent=decision.coordination_intent,
+            decision_source=decision.decision_source, wait_started_at=decision.wait_started_at,
+            reconsider_at=decision.reconsider_at,
+            escalation_stage=decision_state.escalation_stage.value,
+            coverage_pressure=decision_state.coverage_pressure.value,
+            coordination_sendable=decision_state.coordination_sendable,
+            snapshot_id=decision_state.ledger_high_watermark,
+            expected_state_hash_fingerprint=hashlib.sha256(current.state_hash.encode()).hexdigest()[:16],
+        )
         if pending:
             if not self.live:
                 self.state.set("dry_run_action", pending)
                 return
             self._post(poem_room, pending)
+            return
+        if decision.action == Action.WAIT:
+            return
+        if not validate_decision(decision, decision_state):
+            return
+        if (
+            self.state.active_team() != decision.expected_game_id
+            or int(self.state.get("poem_version", -1)) != decision.expected_version
+            or self.state.get("poem_state_hash") != decision.expected_state_hash
+            or int(self.state.get("team_setup", {}).get("room_generation", -1))
+            != decision.expected_room_generation
+        ):
+            return
+        if decision.action == Action.COORDINATE:
+            key = coordination_key(decision_state, decision.target_did,
+                                   decision.coordination_intent or "")
+            if key in sent_keys:
+                return
+            try:
+                text = coordination_text(decision.coordination_intent or "", decision.target_did)
+            except ValueError:
+                return
+            payload = {"type": "sonnet.note.v1", "contest_id": CONTEST_ID,
+                       "game_id": game_id, "purpose": "team_coordination",
+                       "request_id": request_id("coordination"), "text": text}
+            if not self.live:
+                self.state.set("dry_run_action", payload)
+                return
+            self.state.reserve_request(payload["request_id"], f"coordination:{key}", payload)
+            self._post(poem_room, payload)
+            return
+        if decision.action != Action.SARUKU_PROPOSE_WORD:
             return
         try:
             output = LLMClient(self.cfg.openai_api_key_file, self.cfg.model).structured(
@@ -737,16 +852,29 @@ class Daemon:
             if not isinstance(proposed, str):
                 continue
             try:
-                validate_candidate(proposed, current.version, current, self.cfg.official_dir)
+                result = validate_candidate(proposed, current.version, current, self.cfg.official_dir)
             except ValueError:
+                continue
+            syllables = result.get("syllables")
+            if not isinstance(syllables, int) or not qualification_preserved(
+                decision_state, syllables
+            ):
                 continue
             candidate = proposed
             break
-        if candidate is None or int(self.state.get("poem_version", -1)) != current.version:
+        if candidate is None:
             return
-        if not isinstance(game_id, str) or not isinstance(setup.get("room_generation"), int):
+        latest_setup = self.state.get("team_setup", {})
+        if (
+            self.state.active_team() != decision.expected_game_id
+            or int(self.state.get("poem_version", -1)) != decision.expected_version
+            or self.state.get("poem_state_hash") != decision.expected_state_hash
+            or not isinstance(latest_setup, dict)
+            or latest_setup.get("room_generation") != decision.expected_room_generation
+        ):
             return
-        payload = word(game_id, setup["room_generation"], current.version, current.state_hash, candidate)
+        payload = word(game_id, decision.expected_room_generation, current.version,
+                       current.state_hash, candidate)
         if not self.live:
             self.state.set("dry_run_action", payload)
             return

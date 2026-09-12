@@ -201,7 +201,8 @@ def test_conflicting_proposals_preserved_and_stale_after_version(tmp_path: Path)
     for text, target in (("first goes", first), ("second goes", second)):
         value = _empty()
         value["proposals"] = [{
-            "proposal_type": "next_writer", "target_text": target, "value": None,
+            "proposal_type": "next_writer", "proposal_mode": "NOMINATION",
+            "target_text": target, "value": None,
             "scope": "next_word", "confidence": 0.9,
         }]
         outputs[text] = value
@@ -230,7 +231,8 @@ def test_unresolved_alias_remains_null(tmp_path: Path) -> None:
     speaker = did_of(key)
     output = _empty()
     output["proposals"] = [{
-        "proposal_type": "next_writer", "target_text": "Bruce", "value": None,
+        "proposal_type": "next_writer", "proposal_mode": "NOMINATION",
+        "target_text": "Bruce", "value": None,
         "scope": "next_word", "confidence": 0.9,
     }]
     store = _store(tmp_path)
@@ -347,7 +349,8 @@ def test_current_line_proposal_stales_and_constraints_are_preserved(tmp_path: Pa
     key = Ed25519PrivateKey.generate()
     speaker = did_of(key)
     output = _empty()
-    output["proposals"] = [{"proposal_type": "line_shape", "target_text": None,
+    output["proposals"] = [{"proposal_type": "line_shape", "proposal_mode": "PREFERENCE",
+                            "target_text": None,
                             "value": "short", "scope": "current_line", "confidence": 0.8}]
     output["constraints"] = [{"predicate": "rhyme", "value": "night",
                               "scope": "current_line", "confidence": 0.9}]
@@ -432,6 +435,7 @@ def test_capability_announcement_is_at_most_once_per_game(tmp_path: Path) -> Non
 
 def test_team_intelligence_failure_does_not_stop_legacy_writing(monkeypatch, tmp_path: Path) -> None:
     daemon = _writing_daemon(tmp_path)
+    daemon.state.set("poem_state_hash", "hash")
     intro = capability_announcement(GAME, "capabilities-1")
     daemon.state.reserve_request("capabilities-1", f"team_capability_announcement:{GAME}", intro)
     monkeypatch.setattr(
@@ -443,5 +447,8 @@ def test_team_intelligence_failure_does_not_stop_legacy_writing(monkeypatch, tmp
         daemon._writing()
         assert daemon.state.phase == Phase.WRITING
         assert daemon.state.get("last_team_intelligence_error") == "RuntimeError"
+        action = daemon.state.get("dry_run_action")
+        assert action["type"] == "sonnet.note.v1"
+        assert action["purpose"] == "team_coordination"
     finally:
         daemon.state.close()
