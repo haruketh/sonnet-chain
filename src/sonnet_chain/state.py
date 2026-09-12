@@ -59,9 +59,40 @@ class StateStore:
             CREATE TABLE IF NOT EXISTS teams (
               game_id TEXT PRIMARY KEY, payload TEXT NOT NULL, score REAL
             );
+            CREATE TABLE IF NOT EXISTS team_events (
+              event_id TEXT PRIMARY KEY, game_id TEXT NOT NULL, room TEXT NOT NULL,
+              room_generation INTEGER NOT NULL, source_seq INTEGER NOT NULL,
+              source_ordinal INTEGER NOT NULL,
+              source_poem_version INTEGER, evidence_class TEXT NOT NULL,
+              event_type TEXT NOT NULL, actor_did TEXT, subject_did TEXT,
+              scope TEXT, predicate TEXT, value_json TEXT, target_text TEXT,
+              resolved_target_did TEXT, extraction_method TEXT NOT NULL,
+              extraction_confidence REAL, extractor_version INTEGER NOT NULL,
+              payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS team_message_analysis (
+              game_id TEXT NOT NULL, room TEXT NOT NULL, generation INTEGER NOT NULL,
+              seq INTEGER NOT NULL, extractor_version INTEGER NOT NULL,
+              status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+              last_error_code TEXT, processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(game_id,room,generation,seq,extractor_version)
+            );
+            CREATE TABLE IF NOT EXISTS team_context_snapshots (
+              game_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL,
+              reducer_version INTEGER NOT NULL, ledger_high_watermark TEXT NOT NULL,
+              payload_json TEXT NOT NULL, rebuilt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         self.db.commit()
+        team_event_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(team_events)").fetchall()
+        }
+        if "source_ordinal" not in team_event_columns:
+            self.db.execute(
+                "ALTER TABLE team_events ADD COLUMN source_ordinal INTEGER NOT NULL DEFAULT 0"
+            )
+            self.db.commit()
         defaults = {
             "phase": Phase.WAIT_LAUNCH.value,
             "trusted_launch": None,

@@ -32,6 +32,7 @@ from .publisher import CommandPublisher, PublisherAuthRequired, PublisherUnavail
 from .receipts import normalize_llm_receipt, receipt_candidate, receipt_matches
 from .rosters import CanonicalRoster, current_roster_signers, roster_consensus, signed_roster, team_room_is_open
 from .state import Phase, StateStore
+from .team_intelligence import TeamIntelligence, capability_announcement
 from .technocore import Technocore
 
 def before_deadline(store: StateStore) -> bool:
@@ -661,6 +662,20 @@ class Daemon:
         self.state.set("last_error", None)
         self.state.phase = Phase.DISCOVERY
 
+    def _ensure_team_intro(self, poem_room: str, game_id: str) -> bool:
+        kind = f"team_capability_announcement:{game_id}"
+        if self.state.db.execute("SELECT 1 FROM requests WHERE kind=? LIMIT 1", (kind,)).fetchone():
+            return False
+        payload = capability_announcement(game_id, request_id("capabilities"))
+        if not self.live:
+            self.state.set("dry_run_action", payload)
+            return True
+        # This is an application-local planning envelope, not a referee action;
+        # it deliberately expects no receipt.
+        self.state.reserve_request(payload["request_id"], kind, payload)
+        self._post(poem_room, payload)
+        return True
+
     def _writing(self) -> None:
         poem_room = self.state.get("poem_room")
         if not isinstance(poem_room, str):
@@ -668,6 +683,27 @@ class Daemon:
         self._receipts(poem_room)
         if self.state.phase != Phase.WRITING or not before_deadline(self.state):
             return
+        game_id = self.state.active_team()
+        setup = self.state.get("team_setup", {})
+        generation = setup.get("room_generation") if isinstance(setup, dict) else None
+        if not isinstance(game_id, str) or not isinstance(generation, int):
+            return
+        if self._ensure_team_intro(poem_room, game_id):
+            return
+        try:
+            intelligence = TeamIntelligence(
+                self.state,
+                LLMClient(self.cfg.openai_api_key_file, self.cfg.model)
+                if self.cfg.openai_api_key_file is not None else None,
+            )
+            intelligence.sync(
+                game_id, poem_room, generation, self.state.get("current_roster", []),
+                self.state.get("referee_did"),
+                int(self.state.get("line_number", 1) or 1),
+            )
+        except Exception as exc:
+            # Team understanding is observational; failure must not block the legacy writer.
+            self.state.set("last_team_intelligence_error", type(exc).__name__)
         current = PoemState(
             version=int(self.state.get("poem_version", 0) or 0),
             state_hash=self.state.get("poem_state_hash") or "",
@@ -708,8 +744,6 @@ class Daemon:
             break
         if candidate is None or int(self.state.get("poem_version", -1)) != current.version:
             return
-        game_id = self.state.active_team()
-        setup = self.state.get("team_setup", {})
         if not isinstance(game_id, str) or not isinstance(setup.get("room_generation"), int):
             return
         payload = word(game_id, setup["room_generation"], current.version, current.state_hash, candidate)
