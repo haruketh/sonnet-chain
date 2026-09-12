@@ -15,8 +15,8 @@ from .journal import Journal
 from .invites import (
     InviteCandidate,
     application_age_minutes,
+    application_blocks_invite,
     application_expiry_reason,
-    application_was_sent,
     choose_invite,
     direct_invite,
     expired_application_games,
@@ -330,7 +330,7 @@ class Daemon:
                         continue
                     if (
                         invite.game_id in signed_games
-                        or application_was_sent(journal_path, invite.game_id)
+                        or application_blocks_invite(journal_path, invite)
                         or self.state.pending_request(f"application:{invite.game_id}") is not None
                     ):
                         continue
@@ -364,6 +364,10 @@ class Daemon:
                         request_id=pending_app.request_id,
                         reason=expiry_reason,
                     )
+                    self.state.set_request_status(
+                        pending_app.request_id,
+                        "expired",
+                    )
                     pending_app = None
                     if selected is None:
                         return
@@ -381,6 +385,7 @@ class Daemon:
                     game_id=selected.game_id,
                     target_from_did=selected.from_did,
                     request_id=payload["request_id"],
+                    invite_seq=selected.seq,
                 )
                 return
         if not self.state.get("discovery_advertised"):
@@ -418,6 +423,13 @@ class Daemon:
         for consensus in roster_consensus(discovery_events):
             proposal = consensus.roster
             if pending_game is not None and proposal.game_id != pending_game.game_id:
+                continue
+            if (
+                pending_game is not None
+                and pending_game.invite_seq is not None
+                and consensus.completed_at_seq <= pending_game.invite_seq
+            ):
+                # Do not revive a roster completed before this fresh re-invite.
                 continue
             if proposal.game_id in expired_games:
                 continue

@@ -37,6 +37,7 @@ class PendingApplication:
     request_id: str
     sent_at: datetime | None
     progressed: bool = False
+    invite_seq: int | None = None
 
 
 def record_time(record: dict[str, Any]) -> datetime | None:
@@ -185,6 +186,62 @@ def application_was_sent(journal_path: Path, game_id: str) -> bool:
     return False
 
 
+def application_blocks_invite(journal_path: Path, invite: DirectInvite) -> bool:
+    # Block duplicates unless a genuinely fresh invite follows the latest expiry.
+    try:
+        lines = journal_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+    latest_sent: dict[str, Any] | None = None
+    latest_expiry: dict[str, Any] | None = None
+
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return True
+        if not isinstance(record, dict):
+            continue
+
+        if (
+            record.get("event") == "team_application_sent"
+            and record.get("game_id") == invite.game_id
+            and isinstance(record.get("request_id"), str)
+        ):
+            latest_sent = record
+            latest_expiry = None
+            continue
+
+        if latest_sent is None:
+            continue
+
+        if (
+            record.get("event") == "team_application_expired"
+            and record.get("game_id") == invite.game_id
+            and record.get("request_id") == latest_sent.get("request_id")
+        ):
+            latest_expiry = record
+
+    if latest_sent is None:
+        return False
+    if latest_expiry is None:
+        return True
+
+    previous_seq = latest_sent.get("invite_seq")
+    if isinstance(previous_seq, int) and not isinstance(previous_seq, bool):
+        return invite.seq <= previous_seq
+
+    expiry_at = record_time(latest_expiry)
+    if expiry_at is not None and invite.message_time != float("-inf"):
+        invite_at = datetime.fromtimestamp(invite.message_time, tz=timezone.utc)
+        return invite_at <= expiry_at
+
+    return True
+
+
 def pending_application(journal_path: Path) -> PendingApplication | None:
     try:
         lines = journal_path.read_text(encoding="utf-8").splitlines()
@@ -212,7 +269,15 @@ def pending_application(journal_path: Path) -> PendingApplication | None:
                 sent_at = sent_at.astimezone(timezone.utc) if sent_at.tzinfo else None
             except ValueError:
                 sent_at = None
-            pending = PendingApplication(game_id, request_id, sent_at)
+            invite_seq = record.get("invite_seq")
+            if not isinstance(invite_seq, int) or isinstance(invite_seq, bool):
+                invite_seq = None
+            pending = PendingApplication(
+                game_id,
+                request_id,
+                sent_at,
+                invite_seq=invite_seq,
+            )
             continue
         if pending is None or game_id != pending.game_id:
             continue
@@ -304,20 +369,40 @@ def application_should_expire(
 
 
 def expired_application_games(journal_path: Path) -> set[str]:
+    # Only the latest application epoch for a game matters.
     try:
         lines = journal_path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return set()
-    games = set()
+
+    states: dict[str, tuple[str, str | None]] = {}
     for line in lines:
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if (
-            isinstance(record, dict)
-            and record.get("event") == "team_application_expired"
-            and isinstance(record.get("game_id"), str)
-        ):
-            games.add(record["game_id"])
-    return games
+        if not isinstance(record, dict):
+            continue
+
+        game_id = record.get("game_id")
+        request_id = record.get("request_id")
+        if not isinstance(game_id, str):
+            continue
+
+        if record.get("event") == "team_application_sent":
+            states[game_id] = (
+                "pending",
+                request_id if isinstance(request_id, str) else None,
+            )
+            continue
+
+        if record.get("event") == "team_application_expired":
+            current = states.get(game_id)
+            if current is not None and current[1] == request_id:
+                states[game_id] = ("expired", current[1])
+
+    return {
+        game_id
+        for game_id, (state, _) in states.items()
+        if state == "expired"
+    }
