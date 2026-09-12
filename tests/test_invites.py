@@ -96,7 +96,34 @@ def _ready_roster(daemon: Daemon, game_id: str) -> None:
         "request_id": "roster",
     }
     for seq, key in enumerate(keys, 1):
-        daemon.state.record_event(ROOMS.discovery, seq, 1, _signed(key, payload, seq))
+        record = _signed(key, payload, seq)
+        record["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        daemon.state.record_event(ROOMS.discovery, seq, 1, record)
+
+
+def _partial_roster(
+    daemon: Daemon,
+    game_id: str,
+    *,
+    age_minutes: int,
+    seq: int = 1,
+) -> None:
+    keys = [Ed25519PrivateKey.generate() for _ in range(3)]
+    members = [did_of(key) for key in keys] + [SARUKU_DID]
+    payload = {
+        "type": "sonnet.roster.v1",
+        "contest_id": CONTEST_ID,
+        "game_id": game_id,
+        "poem_room": ROOMS.team(game_id),
+        "room_generation": 3,
+        "members": members,
+        "request_id": f"roster-{seq}",
+    }
+    record = _signed(keys[0], payload, seq)
+    record["ts"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    ).isoformat().replace("+00:00", "Z")
+    daemon.state.record_event(ROOMS.discovery, seq, 1, record)
 
 
 def _team_room(daemon: Daemon):
@@ -421,5 +448,38 @@ def test_soft_timeout_without_candidate_keeps_pending(
         assert pending is not None and pending.game_id == "hayes"
         records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
         assert not any(record["event"] == "team_application_expired" for record in records)
+    finally:
+        daemon.state.close()
+
+
+
+def test_step1a1_progress_resets_timeout_clock(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 61)
+    _partial_roster(daemon, "hayes", age_minutes=5)
+    daemon.live = True
+    daemon._post = lambda room, payload: None
+    try:
+        daemon._discovery()
+        pending = pending_application(daemon.journal.path)
+        assert pending is not None and pending.game_id == "hayes"
+        records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
+        assert not any(record["event"] == "team_application_expired" for record in records)
+    finally:
+        daemon.state.close()
+
+
+def test_step1a1_old_progress_eventually_hard_expires(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 120)
+    _partial_roster(daemon, "hayes", age_minutes=61)
+    daemon.live = True
+    daemon._post = lambda room, payload: None
+    try:
+        daemon._discovery()
+        assert pending_application(daemon.journal.path) is None
+        records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
+        expiry = next(record for record in records if record["event"] == "team_application_expired")
+        assert expiry["reason"] == "hard_timeout"
     finally:
         daemon.state.close()

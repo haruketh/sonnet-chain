@@ -39,16 +39,25 @@ class PendingApplication:
     progressed: bool = False
 
 
-def _message_time(record: dict[str, Any]) -> float:
+def record_time(record: dict[str, Any]) -> datetime | None:
     value = record.get("created_at", record.get("timestamp", record.get("ts")))
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            pass
-    return float("-inf")
+            return None
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+    return None
+
+
+def _message_time(record: dict[str, Any]) -> float:
+    parsed = record_time(record)
+    return parsed.timestamp() if parsed is not None else float("-inf")
 
 
 def choose_invite(candidates: Iterable[InviteCandidate]) -> DirectInvite | None:
@@ -231,12 +240,23 @@ def pending_application_game(journal_path: Path) -> str | None:
     return pending.game_id if pending is not None else None
 
 
-def application_age_minutes(pending: PendingApplication, now: datetime) -> float | None:
+def application_age_minutes(
+    pending: PendingApplication,
+    now: datetime,
+    progressed_at: datetime | None = None,
+) -> float | None:
     if now.tzinfo is None:
         raise ValueError("now must include a timezone")
-    if pending.sent_at is None:
+    reference = pending.sent_at
+    if progressed_at is not None:
+        if progressed_at.tzinfo is None:
+            raise ValueError("progressed_at must include a timezone")
+        progressed_at = progressed_at.astimezone(timezone.utc)
+        if reference is None or progressed_at > reference:
+            reference = progressed_at
+    if reference is None:
         return None
-    return max(0.0, (now.astimezone(timezone.utc) - pending.sent_at).total_seconds() / 60)
+    return max(0.0, (now.astimezone(timezone.utc) - reference).total_seconds() / 60)
 
 
 def application_expiry_reason(
@@ -247,15 +267,12 @@ def application_expiry_reason(
     signed_games: set[str],
     progressed_games: set[str],
     better_candidate_available: bool,
+    progressed_at: datetime | None = None,
 ) -> str | None:
-    if (
-        pending.progressed
-        or active_team is not None
-        or pending.game_id in signed_games
-        or pending.game_id in progressed_games
-    ):
+    _ = progressed_games
+    if active_team is not None or pending.game_id in signed_games:
         return None
-    age = application_age_minutes(pending, now)
+    age = application_age_minutes(pending, now, progressed_at=progressed_at)
     if age is None:
         return None
     if age >= 60:
@@ -273,6 +290,7 @@ def application_should_expire(
     signed_games: set[str],
     progressed_games: set[str],
     better_candidate_available: bool = False,
+    progressed_at: datetime | None = None,
 ) -> bool:
     return application_expiry_reason(
         pending,
@@ -281,6 +299,7 @@ def application_should_expire(
         signed_games=signed_games,
         progressed_games=progressed_games,
         better_candidate_available=better_candidate_available,
+        progressed_at=progressed_at,
     ) is not None
 
 

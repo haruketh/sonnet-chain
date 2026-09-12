@@ -22,6 +22,7 @@ from .invites import (
     expired_application_games,
     invite_room_is_open,
     pending_application,
+    record_time,
 )
 from .llm import LLMClient, LLMUnavailable, RECEIPT_SCHEMA, WORDS_SCHEMA
 from .official import sha256, verify_package
@@ -281,33 +282,42 @@ class Daemon:
                 if event.get("_room_generation") == discovery_generation
             ]
             parsed_rosters = [
-                parsed
+                (item, parsed)
                 for item in discovery_events
                 if (parsed := signed_roster(item)) is not None
             ]
             signed_games = {
                 parsed[0].game_id
-                for parsed in parsed_rosters
+                for _, parsed in parsed_rosters
                 if parsed[1] == SARUKU_DID
             }
             roster_games = {
                 parsed[0].game_id
-                for parsed in parsed_rosters
+                for _, parsed in parsed_rosters
                 if SARUKU_DID in parsed[0].members
             }
             pending_app = pending_application(journal_path)
             now = datetime.now(timezone.utc)
-            has_progress = bool(
-                pending_app is not None
-                and (
-                    pending_app.progressed
-                    or pending_app.game_id in signed_games
-                    or pending_app.game_id in roster_games
-                )
+            progressed_at = None
+            if pending_app is not None:
+                for item, parsed in parsed_rosters:
+                    if (
+                        parsed[0].game_id != pending_app.game_id
+                        or SARUKU_DID not in parsed[0].members
+                    ):
+                        continue
+                    stamp = record_time(item)
+                    if stamp is not None and (
+                        progressed_at is None or stamp > progressed_at
+                    ):
+                        progressed_at = stamp
+            age = (
+                application_age_minutes(pending_app, now, progressed_at=progressed_at)
+                if pending_app is not None
+                else None
             )
-            age = application_age_minutes(pending_app, now) if pending_app is not None else None
             scan_candidates = pending_app is None or (
-                not has_progress and age is not None and age >= 20
+                age is not None and age >= 20
             )
             selected = None
             if scan_candidates:
@@ -345,6 +355,7 @@ class Daemon:
                     signed_games=signed_games,
                     progressed_games=roster_games,
                     better_candidate_available=selected is not None,
+                    progressed_at=progressed_at,
                 )
                 if expiry_reason is not None:
                     self._journal(
