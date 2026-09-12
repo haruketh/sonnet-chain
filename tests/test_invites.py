@@ -312,7 +312,7 @@ def test_application_under_twenty_minutes_is_pending(tmp_path: Path) -> None:
 
 def test_stale_application_expires_once(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
-    _record_application(daemon, "hayes", 21)
+    _record_application(daemon, "hayes", 61)
     daemon.live = True
     daemon._post = lambda room, payload: None
     try:
@@ -323,12 +323,13 @@ def test_stale_application_expires_once(tmp_path: Path) -> None:
         assert len(expiries) == 1
         assert expiries[0]["game_id"] == "hayes"
         assert expiries[0]["request_id"] == "application-hayes"
+        assert expiries[0]["reason"] == "hard_timeout"
         assert pending_application(daemon.journal.path) is None
     finally:
         daemon.state.close()
 
 
-def test_expired_application_allows_next_game_on_next_cycle(tmp_path: Path) -> None:
+def test_soft_timeout_moves_to_one_better_candidate(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
     _record_application(daemon, "hayes", 21)
     daemon.state.record_event(
@@ -340,11 +341,14 @@ def test_expired_application_allows_next_game_on_next_cycle(tmp_path: Path) -> N
     daemon.live = True
     try:
         daemon._discovery()
-        assert posted == []
         daemon._discovery()
         assert len(posted) == 1
         assert posted[0]["type"] == "sonnet.application.v1"
         assert posted[0]["game_id"] == "deftink"
+        records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
+        expiries = [record for record in records if record["event"] == "team_application_expired"]
+        assert len(expiries) == 1
+        assert expiries[0]["reason"] == "better_candidate_available"
     finally:
         daemon.state.close()
 
@@ -368,7 +372,7 @@ def test_pending_application_rejects_other_game_roster(tmp_path: Path) -> None:
 
 def test_pending_application_allows_matching_safe_roster(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
-    _record_application(daemon, "hayes", 5)
+    _record_application(daemon, "hayes", 61)
     _ready_roster(daemon, "hayes")
     daemon.tc = _team_room(daemon)
     posted = []
@@ -380,13 +384,15 @@ def test_pending_application_allows_matching_safe_roster(tmp_path: Path) -> None
         assert posted[0]["type"] == "sonnet.roster.v1"
         assert posted[0]["game_id"] == "hayes"
         assert daemon.state.phase == Phase.WAIT_ROSTER_READY
+        records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
+        assert not any(record["event"] == "team_application_expired" for record in records)
     finally:
         daemon.state.close()
 
 
 def test_expired_application_roster_is_never_signed(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
-    _record_application(daemon, "hayes", 21)
+    _record_application(daemon, "hayes", 61)
     daemon.tc = _team_room(daemon)
     posted = []
     daemon._post = lambda room, payload: posted.append(payload)
@@ -397,5 +403,23 @@ def test_expired_application_roster_is_never_signed(tmp_path: Path) -> None:
         daemon._discovery()
         assert posted == []
         assert daemon.state.active_team() is None
+    finally:
+        daemon.state.close()
+
+
+@pytest.mark.parametrize("age_minutes", [21, 59])
+def test_soft_timeout_without_candidate_keeps_pending(
+    tmp_path: Path, age_minutes: int
+) -> None:
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", age_minutes)
+    daemon.live = True
+    daemon._post = lambda room, payload: None
+    try:
+        daemon._discovery()
+        pending = pending_application(daemon.journal.path)
+        assert pending is not None and pending.game_id == "hayes"
+        records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
+        assert not any(record["event"] == "team_application_expired" for record in records)
     finally:
         daemon.state.close()

@@ -14,7 +14,8 @@ from .launch import TrustedLaunch, owner_did, verify_launch_record
 from .journal import Journal
 from .invites import (
     InviteCandidate,
-    application_should_expire,
+    application_age_minutes,
+    application_expiry_reason,
     application_was_sent,
     choose_invite,
     direct_invite,
@@ -290,24 +291,27 @@ class Daemon:
                 if parsed is not None and SARUKU_DID in parsed[0].members
             }
             pending_app = pending_application(journal_path)
-            if pending_app is not None and application_should_expire(
-                pending_app,
-                now=datetime.now(timezone.utc),
-                active_team=self.state.active_team(),
-                signed_games=signed_games,
-                progressed_games=roster_games,
-            ):
-                self._journal(
-                    "team_application_expired",
-                    game_id=pending_app.game_id,
-                    request_id=pending_app.request_id,
+            now = datetime.now(timezone.utc)
+            has_progress = bool(
+                pending_app is not None
+                and (
+                    pending_app.progressed
+                    or pending_app.game_id in signed_games
+                    or pending_app.game_id in roster_games
                 )
-                return
-            if pending_app is None:
+            )
+            age = application_age_minutes(pending_app, now) if pending_app is not None else None
+            scan_candidates = pending_app is None or (
+                not has_progress and age is not None and age >= 20
+            )
+            selected = None
+            if scan_candidates:
                 candidates = []
                 for event in discovery_events:
                     invite = direct_invite(event)
                     if invite is None:
+                        continue
+                    if pending_app is not None and invite.game_id == pending_app.game_id:
                         continue
                     if (
                         invite.game_id in signed_games
@@ -327,22 +331,42 @@ class Daemon:
                         room_verified = True
                     candidates.append(InviteCandidate(invite, room_verified))
                 selected = choose_invite(candidates)
-                if selected is not None:
-                    payload = team_application(selected.game_id, self.cfg.x_account_url)
-                    if not self.live:
-                        self.state.set("dry_run_action", payload)
-                        return
-                    self.state.reserve_request(
-                        payload["request_id"], f"application:{selected.game_id}", payload
-                    )
-                    self._post(ROOMS.discovery, payload)
+            expiry_reason = None
+            if pending_app is not None:
+                expiry_reason = application_expiry_reason(
+                    pending_app,
+                    now=now,
+                    active_team=self.state.active_team(),
+                    signed_games=signed_games,
+                    progressed_games=roster_games,
+                    better_candidate_available=selected is not None,
+                )
+                if expiry_reason is not None:
                     self._journal(
-                        "team_application_sent",
-                        game_id=selected.game_id,
-                        target_from_did=selected.from_did,
-                        request_id=payload["request_id"],
+                        "team_application_expired",
+                        game_id=pending_app.game_id,
+                        request_id=pending_app.request_id,
+                        reason=expiry_reason,
                     )
+                    pending_app = None
+                    if selected is None:
+                        return
+            if pending_app is None and selected is not None:
+                payload = team_application(selected.game_id, self.cfg.x_account_url)
+                if not self.live:
+                    self.state.set("dry_run_action", payload)
                     return
+                self.state.reserve_request(
+                    payload["request_id"], f"application:{selected.game_id}", payload
+                )
+                self._post(ROOMS.discovery, payload)
+                self._journal(
+                    "team_application_sent",
+                    game_id=selected.game_id,
+                    target_from_did=selected.from_did,
+                    request_id=payload["request_id"],
+                )
+                return
         if not self.state.get("discovery_advertised"):
             if self.state.get("discovery_advertisement_attempted"):
                 self.state.set("last_error", "Discovery advertisement outcome is ambiguous; refusing a duplicate")

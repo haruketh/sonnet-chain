@@ -231,6 +231,40 @@ def pending_application_game(journal_path: Path) -> str | None:
     return pending.game_id if pending is not None else None
 
 
+def application_age_minutes(pending: PendingApplication, now: datetime) -> float | None:
+    if now.tzinfo is None:
+        raise ValueError("now must include a timezone")
+    if pending.sent_at is None:
+        return None
+    return max(0.0, (now.astimezone(timezone.utc) - pending.sent_at).total_seconds() / 60)
+
+
+def application_expiry_reason(
+    pending: PendingApplication,
+    *,
+    now: datetime,
+    active_team: str | None,
+    signed_games: set[str],
+    progressed_games: set[str],
+    better_candidate_available: bool,
+) -> str | None:
+    if (
+        pending.progressed
+        or active_team is not None
+        or pending.game_id in signed_games
+        or pending.game_id in progressed_games
+    ):
+        return None
+    age = application_age_minutes(pending, now)
+    if age is None:
+        return None
+    if age >= 60:
+        return "hard_timeout"
+    if age >= 20 and better_candidate_available:
+        return "better_candidate_available"
+    return None
+
+
 def application_should_expire(
     pending: PendingApplication,
     *,
@@ -238,18 +272,16 @@ def application_should_expire(
     active_team: str | None,
     signed_games: set[str],
     progressed_games: set[str],
+    better_candidate_available: bool = False,
 ) -> bool:
-    if now.tzinfo is None:
-        raise ValueError("now must include a timezone")
-    if (
-        pending.sent_at is None
-        or pending.progressed
-        or active_team is not None
-        or pending.game_id in signed_games
-        or pending.game_id in progressed_games
-    ):
-        return False
-    return (now.astimezone(timezone.utc) - pending.sent_at).total_seconds() >= 20 * 60
+    return application_expiry_reason(
+        pending,
+        now=now,
+        active_team=active_team,
+        signed_games=signed_games,
+        progressed_games=progressed_games,
+        better_candidate_available=better_candidate_available,
+    ) is not None
 
 
 def expired_application_games(journal_path: Path) -> set[str]:
