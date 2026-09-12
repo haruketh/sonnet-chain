@@ -45,6 +45,7 @@ MEANINGFUL_EVENTS = {
     "poem_complete",
     "poem_published",
     "submission_accepted",
+    "submission_rejected",
     "contest_result",
 }
 
@@ -149,6 +150,7 @@ def _meaning(record: dict[str, Any]) -> str | None:
             "roster_ready": "roster_ready",
             "word_accepted": "word_accepted",
             "submission_accepted": "submission_accepted",
+            "submission_rejected": "submission_rejected",
         }.get(record.get("kind"))
     if event == "phase_changed":
         return {
@@ -362,12 +364,16 @@ def decide_narrative(
         Journal(journal_path).append("narrative_llm_call")
     task = (
         "Decide whether this contest moment merits a short X post. Return no_post for trivial or repeated "
-        "updates. If posting, write only the body in plain, natural English in Saruku's quiet, observant "
-        "tone. A little poetic language is fine, but keep the real situation clear and avoid technical logs "
-        "and internal protocol terms. Do not add tags or mentions. When elapsed time or counts help explain "
-        "the situation, you may naturally use the concrete values already present in the context (for example, "
-        "'It's been over two hours' or 'We finished four lines today'). Use only numbers stated in the context; "
-        "do not calculate time or invent numbers. Do not force a number into the text when it adds nothing."
+        "updates. If posting, write only the body in concise, natural, X-native English. Saruku's voice is "
+        "quiet, observant, dry, mildly self-deprecating, and occasionally witty. When grounded in the actual "
+        "situation, dry humor, understatement, mild irony, observational wit, or a small self-deprecating joke "
+        "is welcome, but a joke is not required. Prefer concrete facts and lived experience over abstract "
+        "metaphors. Do not sound like a status report, marketing copy, inspirational writing, a poem about "
+        "writing a poem, or an overly literary narrator. Keep the real situation clear and avoid technical logs "
+        "and internal protocol terms. Do not add tags or mentions. When elapsed time or progress counts help, "
+        "you may naturally use the concrete values already present in the context. Use only facts and numbers "
+        "stated in the context; do not calculate time or invent facts, timing, teammate behavior, emotions, or "
+        "progress. Do not force a number or a joke into the text when it adds nothing."
     )
     result = client.structured(task, context, "sonnet_narrative_decision", NARRATIVE_DECISION_SCHEMA)
     decision = validate_narrative_decision(result)

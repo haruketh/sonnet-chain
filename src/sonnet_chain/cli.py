@@ -78,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sp.add_parser("llm-check")
     sp.add_parser("narrative-preview")
+    narrative_post = sp.add_parser("narrative-post")
+    narrative_post.add_argument("--live", action="store_true")
     sp.add_parser("x-configure")
     sp.add_parser("x-auth")
     sp.add_parser("x-status")
@@ -193,6 +195,42 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "formatted_x_preview": formatted,
             }, ensure_ascii=False, indent=2))
+            return 0
+        if args.cmd == "narrative-post":
+            import httpx
+
+            from .llm import LLMClient
+            from .narrative import build_narrative_context, decide_narrative
+            from .narrative_publisher import plan_narrative_post, publish_narrative
+            from .x_oauth import XTokenManager
+
+            journal_path = cfg.state_db.parent / "journal" / "sonnet.jsonl"
+            context = build_narrative_context(journal_path)
+            decision = decide_narrative(
+                LLMClient(cfg.openai_api_key_file, cfg.model), context, journal_path=journal_path
+            )
+            plan = plan_narrative_post(decision, context, journal_path)
+            if not args.live or plan["status"] == "skipped":
+                result = publish_narrative(decision, context, journal_path, live=False)
+            else:
+                required = (cfg.x_client_id_file, cfg.x_client_secret_file, cfg.x_token_file)
+                sonnet_x_dir = Path("/Users/flop/.sonnet-x").resolve()
+                if any(path is None or path.resolve().parent != sonnet_x_dir for path in required):
+                    raise RuntimeError("Sonnet X credentials must come from /Users/flop/.sonnet-x")
+                manager = XTokenManager(
+                    cfg.x_client_id_file, cfg.x_client_secret_file, cfg.x_token_file,
+                    cfg.x_expected_username,
+                )
+                x_client = httpx.Client(timeout=30, follow_redirects=False)
+                try:
+                    result = publish_narrative(
+                        decision, context, journal_path, live=True,
+                        token_manager=manager, client=x_client,
+                    )
+                finally:
+                    x_client.close()
+                    manager.close()
+            print(json.dumps({"decision": decision, "publication": result}, ensure_ascii=False, indent=2))
             return 0
         if args.cmd == "x-configure":
             from .x_oauth import configure_credentials

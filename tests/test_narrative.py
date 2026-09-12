@@ -171,8 +171,14 @@ def test_llm_decision_schema_and_local_validation() -> None:
     assert decision["action"] == "post"
     assert client.call is not None
     assert client.call[2:] == ("sonnet_narrative_decision", NARRATIVE_DECISION_SCHEMA)
-    assert "concrete values already present in the context" in client.call[0]
-    assert "do not calculate time or invent numbers" in client.call[0]
+    prompt = client.call[0]
+    assert "concise, natural, X-native English" in prompt
+    assert "quiet, observant, dry, mildly self-deprecating, and occasionally witty" in prompt
+    assert "a joke is not required" in prompt
+    assert "Do not sound like a status report" in prompt
+    assert "a poem about writing a poem" in prompt
+    assert "concrete values already present in the context" in prompt
+    assert "do not calculate time or invent facts" in prompt
     with pytest.raises(NarrativeError):
         validate_narrative_decision({"action": "no_post", "reason": "Quiet.", "text": "Not empty"})
     with pytest.raises(NarrativeError):
