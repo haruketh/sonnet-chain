@@ -11,6 +11,7 @@ import httpx
 from .cli import emit_or_post, signer_from
 from .config import CONTEST_ID, Config, ROOMS, SARUKU_DID
 from .launch import TrustedLaunch, owner_did, verify_launch_record
+from .journal import Journal
 from .llm import LLMClient, LLMUnavailable, RECEIPT_SCHEMA, WORDS_SCHEMA
 from .official import sha256, verify_package
 from .poetry import PoemState, build_word_index, validate_candidate
@@ -39,16 +40,38 @@ class Daemon:
         self.wait = max(0, min(10, wait))
         self.state = StateStore(cfg.state_db)
         self.tc = Technocore(cfg.technocore_url)
+        self.journal = Journal(cfg.state_db.parent / "journal" / "sonnet.jsonl")
 
     def close(self) -> None:
         self.tc.close()
         self.state.close()
+
+    def _journal(self, event: str, **data: Any) -> None:
+        journal = getattr(self, "journal", None)
+        if journal is None:
+            return
+        try:
+            journal.append(event, **data)
+        except OSError:
+            # Journaling is observability only; never stop contest execution.
+            pass
 
     def _post(self, room: str, payload: dict) -> None:
         if not self.live:
             raise RuntimeError("internal safety gate refused a non-live POST")
         self.state.increment("technocore_write_attempts")
         emit_or_post(self.cfg, room, payload, True)
+        self._journal(
+            "technocore_post_succeeded",
+            room=room,
+            type=payload.get("type"),
+            request_id=payload.get("request_id"),
+            game_id=payload.get("game_id"),
+            word=payload.get("word"),
+            members=payload.get("members"),
+            poem_room=payload.get("poem_room"),
+            room_generation=payload.get("room_generation"),
+        )
 
     def _read(self, room: str) -> list[dict[str, Any]]:
         cursor, stored_generation = self.state.cursor(room)
@@ -172,6 +195,16 @@ class Daemon:
                 continue
             if not accepted:
                 continue
+            self._journal(
+                "receipt_accepted",
+                room=room,
+                kind=receipt.kind,
+                request_id=request_id,
+                status=receipt.payload.get("status"),
+                roster_ready=receipt.payload.get("roster_ready"),
+                state_hash=receipt.payload.get("state_hash"),
+                game_id=pending.get("game_id") if pending else None,
+            )
             if receipt.kind == "registration_accepted":
                 self.state.set_request_status(request_id, "accepted")
                 self.state.set("registered", True)
@@ -391,6 +424,7 @@ class Daemon:
 
     def cycle(self) -> None:
         phase = self.state.phase
+        phase_before = phase
         if phase == Phase.WAIT_LAUNCH:
             self._wait_launch()
         elif phase == Phase.REGISTER:
@@ -416,6 +450,15 @@ class Daemon:
         elif phase == Phase.WAIT_SUBMISSION_RECEIPT:
             self._receipts(ROOMS.submissions)
 
+        phase_after = self.state.phase
+        if phase_after != phase_before:
+            self._journal(
+                "phase_changed",
+                from_phase=phase_before.value,
+                to_phase=phase_after.value,
+                active_team=self.state.active_team(),
+            )
+
     def run(self, max_cycles: int | None = None) -> int:
         cycles = 0
         backoff = 1.0
@@ -426,6 +469,12 @@ class Daemon:
                     backoff = 1.0
                 except (httpx.HTTPError, OSError, ValueError, RuntimeError) as exc:
                     self.state.set("last_error", f"{type(exc).__name__}: {exc}")
+                    self._journal(
+                        "runtime_error",
+                        phase=self.state.phase.value,
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
                     if max_cycles is None:
                         time.sleep(backoff)
                     backoff = min(backoff * 2, 30)
