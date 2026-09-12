@@ -422,7 +422,25 @@ class Daemon:
         journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
         pending_game = pending_application(journal_path)
         expired_games = expired_application_games(journal_path)
-        for consensus in roster_consensus(discovery_events):
+        anchor_signer = (
+            pending_game.inviter_did
+            if (
+                pending_game is not None
+                and pending_game.inviter_did is not None
+                and pending_game.invite_seq is not None
+            )
+            else None
+        )
+        min_anchor_seq = (
+            pending_game.invite_seq
+            if anchor_signer is not None and pending_game is not None
+            else None
+        )
+        for consensus in roster_consensus(
+            discovery_events,
+            anchor_signer=anchor_signer,
+            min_anchor_seq=min_anchor_seq,
+        ):
             proposal = consensus.roster
             if pending_game is not None and proposal.game_id != pending_game.game_id:
                 continue
@@ -456,7 +474,10 @@ class Daemon:
             wait_started = datetime.now(timezone.utc).isoformat()
             self.state.set("roster_wait_started_at", wait_started)
             self.state.set("roster_wait_last_progress_at", wait_started)
-            self.state.set("roster_wait_signers", [SARUKU_DID])
+            self.state.set(
+                "roster_wait_signers",
+                sorted(set(consensus.signers) | {SARUKU_DID}),
+            )
             self.state.set("roster_wait_soft_timeout_noted", False)
             self._post(ROOMS.discovery, payload)
             self.state.phase = Phase.WAIT_ROSTER_READY

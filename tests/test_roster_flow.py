@@ -541,3 +541,166 @@ def test_b1_frozen_team_room_refuses_auto_withdraw(tmp_path: Path):
         assert "refusing automatic withdrawal" in daemon.state.get("last_error")
     finally:
         daemon.state.close()
+
+
+
+def test_b2_inviter_signature_is_enough_for_anchored_consensus():
+    keys, members = roster_fixture()
+    inviter = did_of(keys[0])
+    record = signed(
+        keys[0],
+        ROOMS.discovery,
+        roster_payload("anchored", members, "r-1"),
+        1,
+    )
+
+    result = roster_consensus(
+        [record],
+        anchor_signer=inviter,
+    )
+
+    assert len(result) == 1
+    assert result[0].roster.members == tuple(members)
+    assert result[0].signers == frozenset({inviter})
+
+
+def test_b2_non_inviter_signature_is_not_enough_for_anchored_consensus():
+    keys, members = roster_fixture()
+    inviter = did_of(keys[0])
+    other_record = signed(
+        keys[1],
+        ROOMS.discovery,
+        roster_payload("anchored", members, "r-2"),
+        2,
+    )
+
+    assert roster_consensus(
+        [other_record],
+        anchor_signer=inviter,
+    ) == []
+
+
+def test_b2_inviter_withdrawal_removes_anchor_readiness():
+    keys, members = roster_fixture()
+    inviter = did_of(keys[0])
+    records = [
+        signed(
+            keys[0],
+            ROOMS.discovery,
+            roster_payload("anchored", members, "r-1"),
+            1,
+        ),
+        signed(
+            keys[0],
+            ROOMS.discovery,
+            {
+                "type": "sonnet.withdraw.v1",
+                "contest_id": CONTEST_ID,
+                "game_id": "anchored",
+                "request_id": "withdraw-1",
+            },
+            2,
+        ),
+    ]
+
+    assert roster_consensus(
+        records,
+        anchor_signer=inviter,
+    ) == []
+
+
+def test_b2_daemon_countersigns_when_inviter_signs_exact_roster(
+    tmp_path: Path,
+):
+    referee = did_of(Ed25519PrivateKey.generate())
+    daemon = daemon_fixture(tmp_path, referee)
+    daemon.live = False
+    daemon.state.phase = Phase.DISCOVERY
+    daemon.state.set("registered", True)
+    daemon.state.set("discovery_advertised", True)
+    daemon.state.set("deadline", "2099-01-01T00:00:00Z")
+
+    keys, members = roster_fixture()
+    inviter = did_of(keys[0])
+
+    daemon.journal = __import__(
+        "sonnet_chain.journal",
+        fromlist=["Journal"],
+    ).Journal(tmp_path / "journal" / "sonnet.jsonl")
+    daemon.journal.append(
+        "team_application_sent",
+        game_id="anchored",
+        target_from_did=inviter,
+        request_id="application-anchored",
+        invite_seq=1,
+    )
+
+    # The inviter signs after the invite/application epoch began.
+    raw = signed(
+        keys[0],
+        ROOMS.discovery,
+        roster_payload("anchored", members, "r-inviter"),
+        2,
+    )
+    daemon.state.record_event(ROOMS.discovery, 2, 1, raw)
+
+    class TeamRoom:
+        def owner_note(self, room):
+            return referee
+
+        def read_page(self, room, since, wait):
+            return [], 3
+
+    daemon.tc = TeamRoom()
+
+    try:
+        daemon._discovery()
+        action = daemon.state.get("dry_run_action")
+        assert action["type"] == "sonnet.roster.v1"
+        assert action["game_id"] == "anchored"
+        assert action["members"] == members
+    finally:
+        daemon.state.close()
+
+
+
+def test_b2_anchor_signature_must_be_after_invite_epoch():
+    keys, members = roster_fixture()
+    inviter = did_of(keys[0])
+
+    records = [
+        signed(
+            keys[0],
+            ROOMS.discovery,
+            roster_payload("epoch", members, "r-old-anchor"),
+            5,
+        ),
+        signed(
+            keys[1],
+            ROOMS.discovery,
+            roster_payload("epoch", members, "r-new-other"),
+            11,
+        ),
+    ]
+
+    assert roster_consensus(
+        records,
+        anchor_signer=inviter,
+        min_anchor_seq=10,
+    ) == []
+
+    records.append(
+        signed(
+            keys[0],
+            ROOMS.discovery,
+            roster_payload("epoch", members, "r-new-anchor"),
+            12,
+        )
+    )
+    result = roster_consensus(
+        records,
+        anchor_signer=inviter,
+        min_anchor_seq=10,
+    )
+    assert len(result) == 1
+    assert inviter in result[0].signers

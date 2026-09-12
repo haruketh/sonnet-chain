@@ -141,14 +141,21 @@ def current_roster_signers(
     )
 
 
-def roster_consensus(records: Iterable[dict[str, Any]], saruku_did: str = SARUKU_DID) -> list[RosterConsensus]:
+def roster_consensus(
+    records: Iterable[dict[str, Any]],
+    saruku_did: str = SARUKU_DID,
+    anchor_signer: str | None = None,
+    min_anchor_seq: int | None = None,
+) -> list[RosterConsensus]:
     current: dict[str, CanonicalRoster] = {}
+    current_seq: dict[str, int] = {}
     last_seq: dict[CanonicalRoster, int] = {}
     for record in sorted(records, key=_sequence):
         parsed = signed_roster(record)
         if parsed is not None:
             roster, signer = parsed
             current[signer] = roster
+            current_seq[signer] = _sequence(record)
             last_seq[roster] = max(last_seq.get(roster, 0), _sequence(record))
             continue
         withdrawal = signed_withdrawal(record)
@@ -156,6 +163,7 @@ def roster_consensus(records: Iterable[dict[str, Any]], saruku_did: str = SARUKU
             game_id, signer = withdrawal
             if signer in current and current[signer].game_id == game_id:
                 del current[signer]
+                current_seq.pop(signer, None)
     signatures: dict[CanonicalRoster, set[str]] = {}
     for signer, roster in current.items():
         signatures.setdefault(roster, set()).add(signer)
@@ -163,8 +171,29 @@ def roster_consensus(records: Iterable[dict[str, Any]], saruku_did: str = SARUKU
     for candidate, signers in signatures.items():
         if saruku_did not in candidate.members or saruku_did in signers:
             continue
-        if set(candidate.members) - {saruku_did} <= signers:
-            ready.append(RosterConsensus(candidate, frozenset(signers), last_seq[candidate]))
+
+        if anchor_signer is None:
+            ready_now = set(candidate.members) - {saruku_did} <= signers
+        else:
+            # Early consent is allowed only when the DID that invited Saruku
+            # currently signs this exact canonical roster, and that anchor
+            # signature belongs to this application epoch.
+            ready_now = (
+                anchor_signer in signers
+                and (
+                    min_anchor_seq is None
+                    or current_seq.get(anchor_signer, 0) > min_anchor_seq
+                )
+            )
+
+        if ready_now:
+            ready.append(
+                RosterConsensus(
+                    candidate,
+                    frozenset(signers),
+                    last_seq[candidate],
+                )
+            )
     return sorted(ready, key=lambda item: (item.completed_at_seq, item.roster.game_id, item.roster.members))
 
 

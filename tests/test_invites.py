@@ -98,8 +98,11 @@ def _ready_roster(
     daemon: Daemon,
     game_id: str,
     start_seq: int = 1,
+    first_key: Ed25519PrivateKey | None = None,
 ) -> None:
-    keys = [Ed25519PrivateKey.generate() for _ in range(3)]
+    keys = [first_key or Ed25519PrivateKey.generate()] + [
+        Ed25519PrivateKey.generate() for _ in range(2)
+    ]
     members = [did_of(key) for key in keys] + [SARUKU_DID]
     payload = {
         "type": "sonnet.roster.v1",
@@ -621,12 +624,13 @@ def test_step1a2_new_roster_after_reinvite_can_be_signed(tmp_path: Path) -> None
         daemon._discovery()
         assert posted == []
 
+        fresh_inviter = Ed25519PrivateKey.generate()
         daemon.state.record_event(
             ROOMS.discovery,
             10,
             1,
             _invite(
-                Ed25519PrivateKey.generate(),
+                fresh_inviter,
                 game_id="hayes",
                 seq=10,
                 created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -637,7 +641,7 @@ def test_step1a2_new_roster_after_reinvite_can_be_signed(tmp_path: Path) -> None
         assert posted[0]["type"] == "sonnet.application.v1"
         posted.clear()
 
-        _ready_roster(daemon, "hayes", start_seq=11)
+        _ready_roster(daemon, "hayes", start_seq=11, first_key=fresh_inviter)
         daemon.tc = _team_room(daemon)
         daemon._discovery()
 
@@ -722,5 +726,26 @@ def test_b1_withdrawn_game_blocks_stale_roster_until_new_application(
         assert "hayes" not in expired_application_games(
             daemon.journal.path
         )
+    finally:
+        daemon.state.close()
+
+
+
+def test_b2_pending_application_remembers_inviter(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    inviter = did_of(Ed25519PrivateKey.generate())
+    daemon.journal.append(
+        "team_application_sent",
+        game_id="hayes",
+        target_from_did=inviter,
+        request_id="application-hayes",
+        invite_seq=10,
+    )
+    try:
+        pending = pending_application(daemon.journal.path)
+        assert pending is not None
+        assert pending.game_id == "hayes"
+        assert pending.inviter_did == inviter
+        assert pending.invite_seq == 10
     finally:
         daemon.state.close()

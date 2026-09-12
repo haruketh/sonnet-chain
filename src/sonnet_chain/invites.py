@@ -38,6 +38,7 @@ class PendingApplication:
     sent_at: datetime | None
     progressed: bool = False
     invite_seq: int | None = None
+    inviter_did: str | None = None
 
 
 def record_time(record: dict[str, Any]) -> datetime | None:
@@ -279,11 +280,15 @@ def pending_application(journal_path: Path) -> PendingApplication | None:
             invite_seq = record.get("invite_seq")
             if not isinstance(invite_seq, int) or isinstance(invite_seq, bool):
                 invite_seq = None
+            inviter_did = record.get("target_from_did")
+            if not isinstance(inviter_did, str) or not DID_KEY.fullmatch(inviter_did):
+                inviter_did = None
             pending = PendingApplication(
                 game_id,
                 request_id,
                 sent_at,
                 invite_seq=invite_seq,
+                inviter_did=inviter_did,
             )
             continue
         if pending is None or game_id != pending.game_id:
