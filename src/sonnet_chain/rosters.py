@@ -39,10 +39,6 @@ def signed_roster(record: dict[str, Any], room: str = ROOMS.discovery) -> tuple[
     signer = record.get("from")
     if not isinstance(signer, str) or not DID_KEY.fullmatch(signer):
         return None
-    if not verify_room_signature(
-        room, signer, record.get("nonce", ""), record.get("text", ""), record.get("sig", "")
-    ):
-        return None
     try:
         payload = json.loads(record["text"])
     except (KeyError, TypeError, json.JSONDecodeError):
@@ -50,6 +46,10 @@ def signed_roster(record: dict[str, Any], room: str = ROOMS.discovery) -> tuple[
     if not isinstance(payload, dict) or payload.get("type") != "sonnet.roster.v1":
         return None
     if payload.get("contest_id") != CONTEST_ID:
+        return None
+    if not verify_room_signature(
+        room, signer, record.get("nonce", ""), record.get("text", ""), record.get("sig", "")
+    ):
         return None
     game_id = payload.get("game_id")
     poem_room = payload.get("poem_room")
@@ -86,19 +86,21 @@ def signed_withdrawal(record: dict[str, Any], room: str = ROOMS.discovery) -> tu
     signer = record.get("from")
     if not isinstance(signer, str) or not DID_KEY.fullmatch(signer):
         return None
-    if not verify_room_signature(
-        room, signer, record.get("nonce", ""), record.get("text", ""), record.get("sig", "")
-    ):
-        return None
     try:
         payload = json.loads(record["text"])
     except (KeyError, TypeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or payload.get("type") != "sonnet.withdraw.v1":
         return None
+    if payload.get("contest_id") != CONTEST_ID:
+        return None
+    if not verify_room_signature(
+        room, signer, record.get("nonce", ""), record.get("text", ""), record.get("sig", "")
+    ):
+        return None
     game_id = payload.get("game_id")
     request_id = payload.get("request_id")
-    if payload.get("contest_id") != CONTEST_ID or not isinstance(game_id, str):
+    if not isinstance(game_id, str):
         return None
     if not isinstance(request_id, str) or not request_id:
         return None

@@ -280,15 +280,20 @@ class Daemon:
                 event for event in self.state.events(ROOMS.discovery)
                 if event.get("_room_generation") == discovery_generation
             ]
+            parsed_rosters = [
+                parsed
+                for item in discovery_events
+                if (parsed := signed_roster(item)) is not None
+            ]
             signed_games = {
                 parsed[0].game_id
-                for parsed in (signed_roster(item) for item in discovery_events)
-                if parsed is not None and parsed[1] == SARUKU_DID
+                for parsed in parsed_rosters
+                if parsed[1] == SARUKU_DID
             }
             roster_games = {
                 parsed[0].game_id
-                for parsed in (signed_roster(item) for item in discovery_events)
-                if parsed is not None and SARUKU_DID in parsed[0].members
+                for parsed in parsed_rosters
+                if SARUKU_DID in parsed[0].members
             }
             pending_app = pending_application(journal_path)
             now = datetime.now(timezone.utc)
