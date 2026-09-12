@@ -305,3 +305,239 @@ def test_discovery_dry_run_selects_only_fully_gated_roster(tmp_path: Path):
         assert daemon.state.active_team() is None
     finally:
         daemon.state.close()
+
+
+
+def _set_b1_clock(
+    daemon: Daemon,
+    *,
+    minutes_ago: int,
+    signers: list[str],
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    stamp = (
+        datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    ).isoformat()
+    daemon.state.set("roster_wait_started_at", stamp)
+    daemon.state.set("roster_wait_last_progress_at", stamp)
+    daemon.state.set("roster_wait_signers", signers)
+    daemon.state.set("roster_wait_soft_timeout_noted", False)
+
+
+def _open_team_room(daemon: Daemon, records=None):
+    referee = daemon.state.get("referee_did")
+    records = list(records or [])
+
+    class TeamRoom:
+        def owner_note(self, room):
+            return referee
+
+        def read_page(self, room, since, wait):
+            return records, 3
+
+    return TeamRoom()
+
+
+def test_b1_recent_incomplete_roster_keeps_waiting(tmp_path: Path):
+    referee = did_of(Ed25519PrivateKey.generate())
+    daemon = daemon_fixture(tmp_path, referee)
+    keys, members = roster_fixture()
+    payload = pending_roster(daemon, members)
+    daemon.state.set("team_setup", {
+        "game_id": payload["game_id"],
+        "poem_room": payload["poem_room"],
+        "room_generation": payload["room_generation"],
+        "members": payload["members"],
+    })
+    raw = signed(
+        keys[0],
+        ROOMS.discovery,
+        roster_payload("ours", members, "r-1"),
+        1,
+    )
+    daemon.state.record_event(ROOMS.discovery, 1, 1, raw)
+    _set_b1_clock(
+        daemon,
+        minutes_ago=5,
+        signers=[SARUKU_DID, members[0]],
+    )
+    daemon.tc = _open_team_room(daemon)
+    daemon.live = True
+    posted = []
+    daemon._post = lambda room, body: posted.append(body)
+    try:
+        daemon._wait_roster_ready()
+        assert posted == []
+        assert daemon.state.phase == Phase.WAIT_ROSTER_READY
+        assert daemon.state.active_team() == "ours"
+    finally:
+        daemon.state.close()
+
+
+def test_b1_new_signature_resets_wait_clock(tmp_path: Path):
+    referee = did_of(Ed25519PrivateKey.generate())
+    daemon = daemon_fixture(tmp_path, referee)
+    keys, members = roster_fixture()
+    payload = pending_roster(daemon, members)
+    daemon.state.set("team_setup", {
+        "game_id": payload["game_id"],
+        "poem_room": payload["poem_room"],
+        "room_generation": payload["room_generation"],
+        "members": payload["members"],
+    })
+    for seq, key in enumerate(keys[:2], 1):
+        raw = signed(
+            key,
+            ROOMS.discovery,
+            roster_payload("ours", members, f"r-{seq}"),
+            seq,
+        )
+        daemon.state.record_event(ROOMS.discovery, seq, 1, raw)
+    _set_b1_clock(
+        daemon,
+        minutes_ago=61,
+        signers=[SARUKU_DID, members[0]],
+    )
+    daemon.tc = _open_team_room(daemon)
+    daemon.live = True
+    posted = []
+    daemon._post = lambda room, body: posted.append(body)
+    try:
+        daemon._wait_roster_ready()
+        assert posted == []
+        assert daemon.state.phase == Phase.WAIT_ROSTER_READY
+        assert members[1] in daemon.state.get("roster_wait_signers")
+        progress_at = daemon.state.get("roster_wait_last_progress_at")
+        assert isinstance(progress_at, str)
+    finally:
+        daemon.state.close()
+
+
+def test_b1_fully_signed_roster_never_auto_withdraws(tmp_path: Path):
+    referee = did_of(Ed25519PrivateKey.generate())
+    daemon = daemon_fixture(tmp_path, referee)
+    keys, members = roster_fixture()
+    payload = pending_roster(daemon, members)
+    daemon.state.set("team_setup", {
+        "game_id": payload["game_id"],
+        "poem_room": payload["poem_room"],
+        "room_generation": payload["room_generation"],
+        "members": payload["members"],
+    })
+    for seq, key in enumerate(keys, 1):
+        raw = signed(
+            key,
+            ROOMS.discovery,
+            roster_payload("ours", members, f"r-{seq}"),
+            seq,
+        )
+        daemon.state.record_event(ROOMS.discovery, seq, 1, raw)
+    _set_b1_clock(
+        daemon,
+        minutes_ago=120,
+        signers=[SARUKU_DID] + members[:-1],
+    )
+    daemon.tc = _open_team_room(daemon)
+    daemon.live = True
+    posted = []
+    daemon._post = lambda room, body: posted.append(body)
+    try:
+        daemon._wait_roster_ready()
+        assert posted == []
+        assert daemon.state.phase == Phase.WAIT_ROSTER_READY
+        assert daemon.state.active_team() == "ours"
+    finally:
+        daemon.state.close()
+
+
+def test_b1_stale_incomplete_roster_auto_withdraws(tmp_path: Path):
+    referee = did_of(Ed25519PrivateKey.generate())
+    daemon = daemon_fixture(tmp_path, referee)
+    keys, members = roster_fixture()
+    payload = pending_roster(daemon, members)
+    daemon.state.set("team_setup", {
+        "game_id": payload["game_id"],
+        "poem_room": payload["poem_room"],
+        "room_generation": payload["room_generation"],
+        "members": payload["members"],
+    })
+    raw = signed(
+        keys[0],
+        ROOMS.discovery,
+        roster_payload("ours", members, "r-1"),
+        1,
+    )
+    daemon.state.record_event(ROOMS.discovery, 1, 1, raw)
+    _set_b1_clock(
+        daemon,
+        minutes_ago=61,
+        signers=[SARUKU_DID, members[0]],
+    )
+    daemon.tc = _open_team_room(daemon)
+    daemon.live = True
+    posted = []
+    daemon._post = lambda room, body: posted.append(body)
+    try:
+        daemon._wait_roster_ready()
+        assert len(posted) == 1
+        assert posted[0]["type"] == "sonnet.withdraw.v1"
+        assert posted[0]["game_id"] == "ours"
+        assert daemon.state.pending_request("roster") is None
+        assert daemon.state.active_team() is None
+        assert daemon.state.phase == Phase.DISCOVERY
+    finally:
+        daemon.state.close()
+
+
+def test_b1_frozen_team_room_refuses_auto_withdraw(tmp_path: Path):
+    referee_key = Ed25519PrivateKey.generate()
+    referee = did_of(referee_key)
+    daemon = daemon_fixture(tmp_path, referee)
+    keys, members = roster_fixture()
+    payload = pending_roster(daemon, members)
+    daemon.state.set("team_setup", {
+        "game_id": payload["game_id"],
+        "poem_room": payload["poem_room"],
+        "room_generation": payload["room_generation"],
+        "members": payload["members"],
+    })
+    raw = signed(
+        keys[0],
+        ROOMS.discovery,
+        roster_payload("ours", members, "r-1"),
+        1,
+    )
+    daemon.state.record_event(ROOMS.discovery, 1, 1, raw)
+    _set_b1_clock(
+        daemon,
+        minutes_ago=61,
+        signers=[SARUKU_DID, members[0]],
+    )
+
+    accepted_word = signed(
+        referee_key,
+        ROOMS.team("ours"),
+        {
+            "type": "sonnet.receipt.v1",
+            "contest_id": CONTEST_ID,
+            "request_id": "word-1",
+            "sender_did": members[0],
+            "status": "accepted",
+            "version": 1,
+            "state_hash": "frozen",
+        },
+        1,
+    )
+    daemon.tc = _open_team_room(daemon, [accepted_word])
+    daemon.live = True
+    posted = []
+    daemon._post = lambda room, body: posted.append(body)
+    try:
+        daemon._wait_roster_ready()
+        assert posted == []
+        assert daemon.state.phase == Phase.WAIT_ROSTER_READY
+        assert daemon.state.active_team() == "ours"
+        assert "refusing automatic withdrawal" in daemon.state.get("last_error")
+    finally:
+        daemon.state.close()

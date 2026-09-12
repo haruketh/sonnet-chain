@@ -111,21 +111,45 @@ def signed_withdrawal(record: dict[str, Any], room: str = ROOMS.discovery) -> tu
     return game_id, signer
 
 
-def roster_consensus(records: Iterable[dict[str, Any]], saruku_did: str = SARUKU_DID) -> list[RosterConsensus]:
-    def sequence(record: dict[str, Any]) -> int:
-        try:
-            return int(record.get("seq", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+def _sequence(record: dict[str, Any]) -> int:
+    try:
+        return int(record.get("seq", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
+
+def current_roster_signers(
+    records: Iterable[dict[str, Any]],
+    target: CanonicalRoster,
+) -> frozenset[str]:
     current: dict[str, CanonicalRoster] = {}
-    last_seq: dict[CanonicalRoster, int] = {}
-    for record in sorted(records, key=sequence):
+    for record in sorted(records, key=_sequence):
         parsed = signed_roster(record)
         if parsed is not None:
             roster, signer = parsed
             current[signer] = roster
-            last_seq[roster] = max(last_seq.get(roster, 0), sequence(record))
+            continue
+        withdrawal = signed_withdrawal(record)
+        if withdrawal is not None:
+            game_id, signer = withdrawal
+            if signer in current and current[signer].game_id == game_id:
+                del current[signer]
+    return frozenset(
+        signer
+        for signer, roster in current.items()
+        if roster == target
+    )
+
+
+def roster_consensus(records: Iterable[dict[str, Any]], saruku_did: str = SARUKU_DID) -> list[RosterConsensus]:
+    current: dict[str, CanonicalRoster] = {}
+    last_seq: dict[CanonicalRoster, int] = {}
+    for record in sorted(records, key=_sequence):
+        parsed = signed_roster(record)
+        if parsed is not None:
+            roster, signer = parsed
+            current[signer] = roster
+            last_seq[roster] = max(last_seq.get(roster, 0), _sequence(record))
             continue
         withdrawal = signed_withdrawal(record)
         if withdrawal is not None:

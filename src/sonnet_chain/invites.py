@@ -224,6 +224,13 @@ def application_blocks_invite(journal_path: Path, invite: DirectInvite) -> bool:
             and record.get("request_id") == latest_sent.get("request_id")
         ):
             latest_expiry = record
+            continue
+
+        if (
+            record.get("event") == "roster_wait_withdrawn"
+            and record.get("game_id") == invite.game_id
+        ):
+            latest_expiry = record
 
     if latest_sent is None:
         return False
@@ -399,6 +406,12 @@ def expired_application_games(journal_path: Path) -> set[str]:
         if record.get("event") == "team_application_expired":
             current = states.get(game_id)
             if current is not None and current[1] == request_id:
+                states[game_id] = ("expired", current[1])
+            continue
+
+        if record.get("event") == "roster_wait_withdrawn":
+            current = states.get(game_id)
+            if current is not None:
                 states[game_id] = ("expired", current[1])
 
     return {

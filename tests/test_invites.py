@@ -647,3 +647,80 @@ def test_step1a2_new_roster_after_reinvite_can_be_signed(tmp_path: Path) -> None
         assert daemon.state.phase == Phase.WAIT_ROSTER_READY
     finally:
         daemon.state.close()
+
+
+
+def test_b1_withdrawn_roster_epoch_requires_fresh_invite(tmp_path: Path) -> None:
+    from sonnet_chain.invites import application_blocks_invite
+
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 70, invite_seq=10)
+    daemon.journal.append(
+        "roster_wait_withdrawn",
+        game_id="hayes",
+        request_id="withdraw-1",
+        minutes_since_progress=61.0,
+    )
+    old_invite = direct_invite(
+        _invite(
+            Ed25519PrivateKey.generate(),
+            game_id="hayes",
+            seq=10,
+            created_at=(
+                datetime.now(timezone.utc) - timedelta(minutes=80)
+            ).isoformat().replace("+00:00", "Z"),
+        )
+    )
+    fresh_invite = direct_invite(
+        _invite(
+            Ed25519PrivateKey.generate(),
+            game_id="hayes",
+            seq=20,
+            created_at=datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        )
+    )
+    try:
+        assert old_invite is not None
+        assert fresh_invite is not None
+        assert application_blocks_invite(
+            daemon.journal.path, old_invite
+        )
+        assert not application_blocks_invite(
+            daemon.journal.path, fresh_invite
+        )
+    finally:
+        daemon.state.close()
+
+
+def test_b1_withdrawn_game_blocks_stale_roster_until_new_application(
+    tmp_path: Path,
+) -> None:
+    from sonnet_chain.invites import expired_application_games
+
+    daemon = _daemon(tmp_path)
+    _record_application(daemon, "hayes", 70, invite_seq=10)
+    daemon.journal.append(
+        "roster_wait_withdrawn",
+        game_id="hayes",
+        request_id="withdraw-1",
+        minutes_since_progress=61.0,
+    )
+    try:
+        assert "hayes" in expired_application_games(
+            daemon.journal.path
+        )
+
+        daemon.journal.append(
+            "team_application_sent",
+            game_id="hayes",
+            target_from_did="did:key:zLead",
+            request_id="application-fresh",
+            invite_seq=20,
+        )
+        assert "hayes" not in expired_application_games(
+            daemon.journal.path
+        )
+    finally:
+        daemon.state.close()

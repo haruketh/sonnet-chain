@@ -27,10 +27,10 @@ from .invites import (
 from .llm import LLMClient, LLMUnavailable, RECEIPT_SCHEMA, WORDS_SCHEMA
 from .official import sha256, verify_package
 from .poetry import PoemState, build_word_index, validate_candidate
-from .protocol import discovery_advertisement, register_writer, request_id, submit, team_application, word
+from .protocol import discovery_advertisement, register_writer, request_id, submit, team_application, withdraw, word
 from .publisher import CommandPublisher, PublisherAuthRequired, PublisherUnavailable, canonical_poem
 from .receipts import normalize_llm_receipt, receipt_candidate, receipt_matches
-from .rosters import roster_consensus, signed_roster, team_room_is_open
+from .rosters import CanonicalRoster, current_roster_signers, roster_consensus, signed_roster, team_room_is_open
 from .state import Phase, StateStore
 from .technocore import Technocore
 
@@ -244,11 +244,13 @@ class Daemon:
                 self.state.set("poem_version", 0)
                 self.state.set("poem_state_hash", state_hash)
                 self.state.set("roster_ready", True)
+                self._clear_roster_wait_state()
                 self.state.phase = Phase.WRITING
             elif receipt.kind == "roster_rejected":
                 self.state.set_request_status(request_id, "rejected")
                 self.state.set("active_team", None)
                 self.state.set("team_setup", None)
+                self._clear_roster_wait_state()
                 self.state.phase = Phase.DISCOVERY
             elif receipt.kind == "word_accepted":
                 self.state.set_request_status(request_id, "accepted")
@@ -451,9 +453,192 @@ class Daemon:
                 "room_generation": proposal.room_generation,
                 "members": list(proposal.members),
             })
+            wait_started = datetime.now(timezone.utc).isoformat()
+            self.state.set("roster_wait_started_at", wait_started)
+            self.state.set("roster_wait_last_progress_at", wait_started)
+            self.state.set("roster_wait_signers", [SARUKU_DID])
+            self.state.set("roster_wait_soft_timeout_noted", False)
             self._post(ROOMS.discovery, payload)
             self.state.phase = Phase.WAIT_ROSTER_READY
             return
+
+    def _clear_roster_wait_state(self) -> None:
+        self.state.set("roster_wait_started_at", None)
+        self.state.set("roster_wait_last_progress_at", None)
+        self.state.set("roster_wait_signers", [])
+        self.state.set("roster_wait_soft_timeout_noted", False)
+
+    def _wait_roster_ready(self) -> None:
+        # Referee resolution wins every race. Process receipts first.
+        self._receipts(ROOMS.discovery)
+        if self.state.phase != Phase.WAIT_ROSTER_READY:
+            return
+
+        pending = self.state.pending_request("roster")
+        if not isinstance(pending, dict):
+            self.state.set(
+                "last_error",
+                "WAIT_ROSTER_READY without a pending roster; refusing automatic action",
+            )
+            return
+
+        game_id = pending.get("game_id")
+        poem_room = pending.get("poem_room")
+        generation = pending.get("room_generation")
+        members = pending.get("members")
+        if (
+            not isinstance(game_id, str)
+            or not isinstance(poem_room, str)
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or not isinstance(members, list)
+            or not all(isinstance(member, str) for member in members)
+            or SARUKU_DID not in members
+            or self.state.active_team() != game_id
+        ):
+            self.state.set(
+                "last_error",
+                "invalid roster wait state; refusing automatic withdrawal",
+            )
+            return
+
+        target = CanonicalRoster(
+            game_id,
+            poem_room,
+            generation,
+            tuple(members),
+        )
+
+        _, discovery_generation = self.state.cursor(ROOMS.discovery)
+        discovery_events = [
+            event
+            for event in self.state.events(ROOMS.discovery)
+            if event.get("_room_generation") == discovery_generation
+        ]
+        observed = set(current_roster_signers(discovery_events, target))
+        # Our POST may be absent from the local read after an ambiguous
+        # transport outcome. Treat our consent as potentially live.
+        observed.add(SARUKU_DID)
+
+        previous_raw = self.state.get("roster_wait_signers", [])
+        previous = {
+            signer
+            for signer in previous_raw
+            if isinstance(signer, str)
+        } if isinstance(previous_raw, list) else {SARUKU_DID}
+
+        additions = observed - previous
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        if additions:
+            self.state.set("roster_wait_last_progress_at", now_iso)
+            self._journal(
+                "roster_wait_progress",
+                game_id=game_id,
+                added_signers=sorted(additions),
+                signer_count=len(observed),
+                member_count=len(members),
+            )
+        self.state.set("roster_wait_signers", sorted(observed))
+
+        # Once every listed member is on the exact canonical roster, do not
+        # auto-withdraw. At this point we only wait for the referee receipt.
+        if set(members) <= observed:
+            return
+
+        raw_progress_at = self.state.get("roster_wait_last_progress_at")
+        if not isinstance(raw_progress_at, str):
+            self.state.set("roster_wait_last_progress_at", now_iso)
+            return
+        try:
+            progress_at = datetime.fromisoformat(
+                raw_progress_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            self.state.set("roster_wait_last_progress_at", now_iso)
+            return
+        if progress_at.tzinfo is None:
+            self.state.set("roster_wait_last_progress_at", now_iso)
+            return
+        age_minutes = max(
+            0.0,
+            (now - progress_at.astimezone(timezone.utc)).total_seconds() / 60,
+        )
+
+        if (
+            age_minutes >= 20
+            and not bool(self.state.get("roster_wait_soft_timeout_noted"))
+        ):
+            self.state.set("roster_wait_soft_timeout_noted", True)
+            self._journal(
+                "roster_wait_soft_timeout",
+                game_id=game_id,
+                minutes_since_progress=round(age_minutes, 2),
+                signer_count=len(observed),
+                member_count=len(members),
+            )
+
+        if age_minutes < 60:
+            return
+
+        # Fail closed on any hint that the roster may already be frozen.
+        referee = self.state.get("referee_did")
+        if not isinstance(referee, str):
+            return
+        owner = self.tc.owner_note(poem_room)
+        room_records, actual_generation = self.tc.read_page(
+            poem_room, 0, 0
+        )
+        if not team_room_is_open(
+            target,
+            referee,
+            owner,
+            actual_generation,
+            room_records,
+        ):
+            self.state.set(
+                "last_error",
+                "team room may be frozen/closed; refusing automatic withdrawal",
+            )
+            return
+
+        withdraw_pending = self.state.pending_request("withdraw")
+        withdraw_payload = withdraw_pending or withdraw(game_id)
+        if not self.live:
+            self.state.set("dry_run_action", withdraw_payload)
+            return
+
+        if withdraw_pending is None:
+            self.state.reserve_request(
+                withdraw_payload["request_id"],
+                "withdraw",
+                withdraw_payload,
+            )
+
+        self._post(ROOMS.discovery, withdraw_payload)
+        self.state.set_request_status(
+            withdraw_payload["request_id"],
+            "posted",
+        )
+        roster_request_id = pending.get("request_id")
+        if isinstance(roster_request_id, str):
+            self.state.set_request_status(
+                roster_request_id,
+                "withdrawn",
+            )
+        self._journal(
+            "roster_wait_withdrawn",
+            game_id=game_id,
+            request_id=withdraw_payload["request_id"],
+            minutes_since_progress=round(age_minutes, 2),
+        )
+        self.state.set("active_team", None)
+        self.state.set("team_setup", None)
+        self.state.set("roster_candidate", None)
+        self.state.set("roster_consent_accepted", False)
+        self._clear_roster_wait_state()
+        self.state.set("last_error", None)
+        self.state.phase = Phase.DISCOVERY
 
     def _writing(self) -> None:
         poem_room = self.state.get("poem_room")
@@ -578,7 +763,7 @@ class Daemon:
             # deterministic roster discovery without issuing a write.
             self.state.phase = Phase.DISCOVERY
         elif phase == Phase.WAIT_ROSTER_READY:
-            self._receipts(ROOMS.discovery)
+            self._wait_roster_ready()
         elif phase == Phase.WRITING:
             self._writing()
         elif phase == Phase.POEM_COMPLETE:
