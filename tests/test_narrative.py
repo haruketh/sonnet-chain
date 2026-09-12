@@ -178,7 +178,10 @@ def test_llm_decision_schema_and_local_validation() -> None:
     assert "Do not sound like a status report" in prompt
     assert "a poem about writing a poem" in prompt
     assert "concrete values already present in the context" in prompt
-    assert "do not calculate time or invent facts" in prompt
+    assert "round them as a person naturally would" in prompt
+    assert "never round in a way that contradicts the facts" in prompt
+    assert "Do not calculate a new time" in prompt
+    assert "Do not use internal phase names" in prompt
     with pytest.raises(NarrativeError):
         validate_narrative_decision({"action": "no_post", "reason": "Quiet.", "text": "Not empty"})
     with pytest.raises(NarrativeError):

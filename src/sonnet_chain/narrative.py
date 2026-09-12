@@ -372,8 +372,12 @@ def decide_narrative(
         "writing a poem, or an overly literary narrator. Keep the real situation clear and avoid technical logs "
         "and internal protocol terms. Do not add tags or mentions. When elapsed time or progress counts help, "
         "you may naturally use the concrete values already present in the context. Use only facts and numbers "
-        "stated in the context; do not calculate time or invent facts, timing, teammate behavior, emotions, or "
-        "progress. Do not force a number or a joke into the text when it adds nothing."
+        "stated in the context. Treat exact elapsed times there as the factual source, but round them as a person "
+        "naturally would in an X post: 168 minutes may be 'nearly three hours', 123 minutes 'just over two "
+        "hours', and 61 minutes 'about an hour'. Use exact minutes only when that precision matters, and never "
+        "round in a way that contradicts the facts. Do not calculate a new time or invent facts, timing, teammate "
+        "behavior, emotions, or progress. Do not use internal phase names such as DISCOVERY in outward-facing "
+        "text. Do not force a number or a joke into the text when it adds nothing."
     )
     result = client.structured(task, context, "sonnet_narrative_decision", NARRATIVE_DECISION_SCHEMA)
     decision = validate_narrative_decision(result)
