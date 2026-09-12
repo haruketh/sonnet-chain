@@ -5,7 +5,7 @@ import re
 import secrets
 from typing import Iterable
 
-from .config import CONTEST_ID, ROOMS
+from .config import CONTEST_ID, ROOMS, SARUKU_DID
 
 GAME_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")
 
@@ -47,6 +47,26 @@ def discovery_advertisement(rid: str | None = None) -> dict:
         "text": (
             "Saruku is a registered writer and available for a roster. "
             "Include my DID in a valid 4-8 writer sonnet.roster.v1 proposal if you want me to join."
+        ),
+    }
+
+
+def team_application(game_id: str, x_account_url: str, rid: str | None = None) -> dict:
+    if not GAME_ID.fullmatch(game_id):
+        raise ValueError("game_id must be 1-16 lowercase letters/digits/_/-, starting alphanumeric")
+    if not isinstance(x_account_url, str) or not x_account_url:
+        raise ValueError("x_account_url is required")
+    return {
+        "type": "sonnet.application.v1",
+        "contest_id": CONTEST_ID,
+        "game_id": game_id,
+        "did": SARUKU_DID,
+        "role": "writer",
+        "x_account_url": x_account_url,
+        "request_id": rid or request_id("application"),
+        "text": (
+            f"YES {game_id}. Registered Sonnet-2 writer. No live roster consent. "
+            "Ready to countersign the exact canonical roster when posted."
         ),
     }
 
