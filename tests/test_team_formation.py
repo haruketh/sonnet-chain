@@ -43,6 +43,52 @@ def test_history_continuity_and_multiple_gaps():
     assert not history.is_complete(100, 110)
 
 
+def test_retention_floor_is_not_a_reconcilable_gap():
+    history = FormationHistoryState("room", 1)
+    history.observe(
+        [*range(1, 1415), *range(85215, 90001)],
+        available_from_seq=85215, available_through_seq=90000,
+    )
+    assert history.gap_ranges == []
+    assert history.reconciliation_required is False
+    assert history.retention_truncated is True
+    assert history.is_complete(85215, 90000)
+    assert not history.is_complete(1000, 90000)
+
+
+def test_missing_sequence_inside_retained_interval_is_reconcilable():
+    history = FormationHistoryState("room", 1)
+    history.observe(
+        [*range(85215, 86000), *range(86011, 90001)],
+        available_from_seq=85215, available_through_seq=90000,
+    )
+    assert [(gap.start, gap.end) for gap in history.gap_ranges] == [(86000, 86010)]
+    assert history.reconciliation_required is True
+
+
+def test_retention_boundary_survives_restart(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    store = TeamFormationStore(state)
+    history = FormationHistoryState("room", 7)
+    history.observe([1, 85215, 85216], available_from_seq=85215, available_through_seq=85216)
+    store.save_history(history)
+    state.close()
+    state = StateStore(tmp_path / "state.db")
+    restored = TeamFormationStore(state).load_history("room", 7)
+    assert restored is not None
+    assert restored.available_from_seq == 85215
+    assert restored.retention_truncated is True
+    assert restored.reconciliation_required is False
+    assert not restored.is_complete(1, 85216)
+    state.close()
+
+
+def test_positive_terminal_fact_still_outranks_truncated_history():
+    assert formation_decision(
+        None, history_complete=False, team_ready=True, now=datetime.now(timezone.utc)
+    ) == "TEAM_READY"
+
+
 def test_history_reconciliation_and_generation_are_persistent(tmp_path: Path):
     state = StateStore(tmp_path / "state.db")
     formation = TeamFormationStore(state)

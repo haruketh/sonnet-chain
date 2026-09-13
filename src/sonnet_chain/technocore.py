@@ -18,6 +18,19 @@ class RoomRecord:
     raw: dict[str, Any]
 
 
+@dataclass
+class RoomPage:
+    records: list[RoomRecord]
+    generation: int | None
+    first_seq: int | None
+    last_seq: int | None
+
+    def __iter__(self):
+        # Preserve existing two-value unpacking at non-STEP1 call sites.
+        yield self.records
+        yield self.generation
+
+
 def _records_from_json(data: Any) -> list[dict]:
     if isinstance(data, list):
         return [x for x in data if isinstance(x, dict)]
@@ -53,7 +66,7 @@ class Technocore:
                 out.append(RoomRecord(seq=seq, sender=sender if isinstance(sender, str) else None, text=text, raw=item))
         return out
 
-    def read_page(self, room: str, since: int = 0, wait: int = 0) -> tuple[list[RoomRecord], int | None]:
+    def read_page(self, room: str, since: int = 0, wait: int = 0) -> RoomPage:
         params = {"format": "json", "since": since, "limit": 200}
         if wait:
             params["wait"] = max(0, min(10, wait))
@@ -61,18 +74,7 @@ class Technocore:
         r.raise_for_status()
         data = r.json()
         first_seq = data.get("first_seq") if isinstance(data, dict) else None
-        if isinstance(first_seq, int) and first_seq > since + 1:
-            export = self.client.get(f"{self.base_url}/r/{room}/export")
-            export.raise_for_status()
-            items = []
-            for line in export.text.splitlines():
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(item, dict) and int(item.get("seq", 0) or 0) > since:
-                    items.append(item)
-            data = {"messages": items, "generation": int(export.headers.get("X-Room-Generation", "0") or 0)}
+        last_seq = data.get("last_seq") if isinstance(data, dict) else None
         records = []
         for item in _records_from_json(data):
             seq = int(item.get("seq", 0) or 0)
@@ -81,9 +83,13 @@ class Technocore:
             if isinstance(text, str):
                 records.append(RoomRecord(seq, sender if isinstance(sender, str) else None, text, item))
         generation = data.get("generation") if isinstance(data, dict) else None
-        return records, generation if isinstance(generation, int) else None
+        return RoomPage(
+            records, generation if isinstance(generation, int) else None,
+            first_seq if isinstance(first_seq, int) else None,
+            last_seq if isinstance(last_seq, int) else None,
+        )
 
-    def export_history(self, room: str) -> tuple[list[RoomRecord], int | None]:
+    def export_history(self, room: str) -> RoomPage:
         """Fetch authoritative retained room history for explicit gap repair."""
         response = self.client.get(f"{self.base_url}/r/{room}/export")
         response.raise_for_status()
@@ -108,7 +114,8 @@ class Technocore:
             generation = int(generation_raw) if generation_raw is not None else None
         except ValueError:
             generation = None
-        return records, generation
+        seqs = [record.seq for record in records]
+        return RoomPage(records, generation, min(seqs) if seqs else None, max(seqs) if seqs else None)
 
     def owner_note(self, room: str) -> Any | None:
         r = self.client.get(f"{self.base_url}/kv/room-owners/{room}")

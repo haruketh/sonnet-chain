@@ -6,22 +6,28 @@ import pytest
 from sonnet_chain.technocore import Technocore
 
 
-def test_gap_uses_export_and_preserves_generation():
+def test_read_page_exposes_authoritative_retained_metadata_without_auto_export():
+    export_calls = 0
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal export_calls
         if request.url.path.endswith("/export"):
+            export_calls += 1
             rows = [json.dumps({"seq": i, "from": "x", "text": str(i)}) for i in range(1, 4)]
             return httpx.Response(200, text="\n".join(rows), headers={"X-Room-Generation": "7"})
-        return httpx.Response(200, json={"first_seq": 3, "generation": 7, "messages": [{"seq": 3, "text": "3"}]})
+        return httpx.Response(200, json={"first_seq": 3, "last_seq": 3, "generation": 7, "messages": [{"seq": 3, "text": "3"}]})
 
     tc = Technocore("https://example.test")
     tc.client.close()
     tc.client = httpx.Client(transport=httpx.MockTransport(handler))
     try:
-        records, generation = tc.read_page("room", since=0)
+        page = tc.read_page("room", since=0)
+        records, generation = page
     finally:
         tc.close()
-    assert [record.seq for record in records] == [1, 2, 3]
+    assert [record.seq for record in records] == [3]
     assert generation == 7
+    assert (page.first_seq, page.last_seq) == (3, 3)
+    assert export_calls == 0
 
 
 def test_explicit_export_history_supports_policy_gap_repair():

@@ -96,6 +96,8 @@ class StateStore:
               highest_observed_seq INTEGER NOT NULL DEFAULT 0,
               gap_ranges_json TEXT NOT NULL DEFAULT '[]',
               reconciliation_required INTEGER NOT NULL DEFAULT 0,
+              available_from_seq INTEGER, available_through_seq INTEGER,
+              retention_truncated INTEGER NOT NULL DEFAULT 0,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               PRIMARY KEY(room,generation)
             );
@@ -149,6 +151,17 @@ class StateStore:
                 "ALTER TABLE team_events ADD COLUMN source_ordinal INTEGER NOT NULL DEFAULT 0"
             )
             self.db.commit()
+        history_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(formation_history_state)").fetchall()
+        }
+        for name, definition in (
+            ("available_from_seq", "INTEGER"),
+            ("available_through_seq", "INTEGER"),
+            ("retention_truncated", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in history_columns:
+                self.db.execute(f"ALTER TABLE formation_history_state ADD COLUMN {name} {definition}")
+        self.db.commit()
         # A normalized registration_accepted row could only have been created
         # after pinned-referee signature and schema verification. Historically
         # `accepted` meant "matched Saruku's pending request"; for registration

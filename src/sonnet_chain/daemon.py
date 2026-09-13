@@ -105,10 +105,12 @@ class Daemon:
 
     def _read(self, room: str) -> list[dict[str, Any]]:
         cursor, stored_generation = self.state.cursor(room)
-        records, generation = self.tc.read_page(room, cursor, self.wait)
+        page = self.tc.read_page(room, cursor, self.wait)
+        records, generation = page
         if stored_generation is not None and generation is not None and generation != stored_generation:
             self.state.reset_cursor(room, generation)
-            records, generation = self.tc.read_page(room, 0, 0)
+            page = self.tc.read_page(room, 0, 0)
+            records, generation = page
         elif stored_generation is None and generation is not None and not records:
             self.state.reset_cursor(room, generation)
         fresh = []
@@ -120,8 +122,25 @@ class Daemon:
                 "SELECT seq FROM events WHERE room=? AND generation=? ORDER BY seq",
                 (room, generation),
             ).fetchall()
-            history = FormationHistoryState(room, generation)
-            history.observe(row["seq"] for row in rows)
+            history = (
+                TeamFormationStore(self.state).load_history(room, generation)
+                or FormationHistoryState(room, generation)
+            )
+            response_first = getattr(page, "first_seq", None)
+            # On an incremental response first_seq is normally cursor+1, not
+            # the retained-ring floor. It proves truncation only when it jumps
+            # over the requested cursor (or during a baseline read from zero).
+            retained_floor = (
+                response_first
+                if isinstance(response_first, int)
+                and (cursor == 0 or response_first > cursor + 1)
+                else None
+            )
+            history.observe(
+                (row["seq"] for row in rows),
+                available_from_seq=retained_floor,
+                available_through_seq=getattr(page, "last_seq", None),
+            )
             TeamFormationStore(self.state).save_history(history)
             if history.reconciliation_required:
                 self._journal(
@@ -136,8 +155,17 @@ class Daemon:
     ) -> bool:
         """Actively repair a required interval, then recompute continuity."""
         formation = TeamFormationStore(self.state)
+        existing = formation.load_history(room, generation)
+        if (
+            existing is not None and existing.available_from_seq is not None
+            and start_seq < existing.available_from_seq
+        ):
+            # The authoritative retained ring has already proven this prefix
+            # unavailable. Re-export cannot restore it; remain fail-closed.
+            return False
         try:
-            records, exported_generation = self.tc.export_history(room)
+            page = self.tc.export_history(room)
+            records, exported_generation = page
             if exported_generation is not None and exported_generation != generation:
                 raise RuntimeError("authoritative export generation changed")
             for record in records:
@@ -147,7 +175,11 @@ class Daemon:
                 (room, generation),
             ).fetchall()
             history = FormationHistoryState(room, generation)
-            history.observe(row["seq"] for row in rows)
+            history.observe(
+                (row["seq"] for row in rows),
+                available_from_seq=getattr(page, "first_seq", None),
+                available_through_seq=getattr(page, "last_seq", None),
+            )
             formation.save_history(history)
             complete = history.is_complete(start_seq, end_seq)
         except Exception as exc:

@@ -10,7 +10,7 @@ from sonnet_chain.config import Config, ROOMS
 from sonnet_chain.daemon import Daemon
 from sonnet_chain.journal import Journal
 from sonnet_chain.state import Phase, StateStore
-from sonnet_chain.technocore import RoomRecord
+from sonnet_chain.technocore import RoomPage, RoomRecord
 from sonnet_chain.team_formation import (
     ApplicationDelivery, ConsentDelivery, FormationOpportunity, TeamFormationStore,
     formation_decision, start_epoch,
@@ -154,5 +154,36 @@ def test_daemon_gap_reconciliation_failure_remains_fail_closed(tmp_path: Path):
     try:
         assert not daemon._reconcile_history("room", 1, 1, 3)
         assert TeamFormationStore(daemon.state).load_history("room", 1).reconciliation_required
+    finally:
+        daemon.state.close()
+
+
+def test_expired_prefix_is_exported_once_then_never_retried_after_restart(tmp_path: Path):
+    daemon = daemon_fixture(tmp_path)
+    from sonnet_chain.team_formation import FormationHistoryState
+    history = FormationHistoryState("room", 1)
+    history.observe([1, 3])
+    TeamFormationStore(daemon.state).save_history(history)
+    calls = {"count": 0}
+
+    class TC:
+        def export_history(self, room):
+            calls["count"] += 1
+            records = [RoomRecord(seq, None, str(seq), {"seq": seq, "text": str(seq)})
+                       for seq in range(3, 6)]
+            return RoomPage(records, 1, 3, 5)
+
+    daemon.tc = TC()
+    assert not daemon._reconcile_history("room", 1, 1, 5)
+    saved = TeamFormationStore(daemon.state).load_history("room", 1)
+    assert saved.retention_truncated
+    assert not saved.reconciliation_required
+    daemon.state.close()
+
+    daemon = daemon_fixture(tmp_path)
+    daemon.tc = TC()
+    try:
+        assert not daemon._reconcile_history("room", 1, 1, 5)
+        assert calls["count"] == 1
     finally:
         daemon.state.close()

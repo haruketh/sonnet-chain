@@ -66,33 +66,46 @@ class FormationHistoryState:
     highest_observed_seq: int = 0
     gap_ranges: list[GapRange] = field(default_factory=list)
     reconciliation_required: bool = False
+    available_from_seq: int | None = None
+    available_through_seq: int | None = None
+    retention_truncated: bool = False
 
-    def observe(self, seqs: Iterable[int]) -> None:
+    def observe(
+        self, seqs: Iterable[int], *, available_from_seq: int | None = None,
+        available_through_seq: int | None = None,
+    ) -> None:
         observed = sorted({int(seq) for seq in seqs if int(seq) > 0})
-        if not observed:
+        if available_from_seq is not None:
+            self.available_from_seq = available_from_seq
+        if available_through_seq is not None:
+            self.available_through_seq = available_through_seq
+        if not observed or self.available_from_seq is not None and self.available_through_seq is None:
             return
-        self.highest_observed_seq = max(self.highest_observed_seq, observed[-1])
-        present = set(observed)
-        start = self.complete_from_seq if self.complete_from_seq is not None else observed[0]
+        floor = self.available_from_seq if self.available_from_seq is not None else observed[0]
+        ceiling = self.available_through_seq if self.available_through_seq is not None else observed[-1]
+        retained = [seq for seq in observed if floor <= seq <= ceiling]
+        self.highest_observed_seq = ceiling
+        start = floor
         self.complete_from_seq = start
         self.gap_ranges = []
         cursor = start
-        while cursor <= self.highest_observed_seq:
-            if cursor in present:
-                cursor += 1
-                continue
-            gap_start = cursor
-            while cursor <= self.highest_observed_seq and cursor not in present:
-                cursor += 1
-            self.gap_ranges.append(GapRange(gap_start, cursor - 1))
+        for seq in retained:
+            if seq > cursor:
+                self.gap_ranges.append(GapRange(cursor, seq - 1))
+            cursor = max(cursor, seq + 1)
+        if cursor <= ceiling:
+            self.gap_ranges.append(GapRange(cursor, ceiling))
         self.complete_through_seq = (
             self.gap_ranges[0].start - 1 if self.gap_ranges else self.highest_observed_seq
         )
         self.reconciliation_required = bool(self.gap_ranges)
+        self.retention_truncated = floor > 1 or any(seq < floor for seq in observed)
 
     def is_complete(self, start_seq: int, end_seq: int) -> bool:
         if end_seq < start_seq:
             return True
+        if self.available_from_seq is not None and start_seq < self.available_from_seq:
+            return False
         if self.complete_from_seq is None or start_seq < self.complete_from_seq:
             return False
         if end_seq > self.highest_observed_seq:
@@ -408,14 +421,19 @@ class TeamFormationStore:
         with self.state.db:
             self.state.db.execute(
                 "INSERT INTO formation_history_state(room,generation,complete_from_seq,"
-                "complete_through_seq,highest_observed_seq,gap_ranges_json,reconciliation_required) "
-                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(room,generation) DO UPDATE SET "
+                "complete_through_seq,highest_observed_seq,gap_ranges_json,reconciliation_required,"
+                "available_from_seq,available_through_seq,retention_truncated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(room,generation) DO UPDATE SET "
                 "complete_from_seq=excluded.complete_from_seq,complete_through_seq=excluded.complete_through_seq,"
                 "highest_observed_seq=excluded.highest_observed_seq,gap_ranges_json=excluded.gap_ranges_json,"
-                "reconciliation_required=excluded.reconciliation_required,updated_at=CURRENT_TIMESTAMP",
+                "reconciliation_required=excluded.reconciliation_required,"
+                "available_from_seq=excluded.available_from_seq,"
+                "available_through_seq=excluded.available_through_seq,"
+                "retention_truncated=excluded.retention_truncated,updated_at=CURRENT_TIMESTAMP",
                 (history.room, history.generation, history.complete_from_seq,
                  history.complete_through_seq, history.highest_observed_seq, gaps,
-                 int(history.reconciliation_required)),
+                 int(history.reconciliation_required), history.available_from_seq,
+                 history.available_through_seq, int(history.retention_truncated)),
             )
 
     def load_history(self, room: str, generation: int) -> FormationHistoryState | None:
@@ -429,7 +447,8 @@ class TeamFormationStore:
             room, generation, row["complete_from_seq"], row["complete_through_seq"],
             row["highest_observed_seq"],
             [GapRange(**item) for item in json.loads(row["gap_ranges_json"])],
-            bool(row["reconciliation_required"]),
+            bool(row["reconciliation_required"]), row["available_from_seq"],
+            row["available_through_seq"], bool(row["retention_truncated"]),
         )
 
 
