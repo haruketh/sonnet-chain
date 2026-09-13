@@ -8,13 +8,14 @@ from .config import CONTEST_ID, ROOMS, SARUKU_DID
 from .signing import verify_room_signature
 
 ReceiptKind = Literal[
-    "registration_accepted", "registration_rejected", "team_setup", "roster_consent_accepted",
+    "registration_accepted", "registration_rejected", "application_rejected", "team_setup", "roster_consent_accepted",
     "roster_ready", "roster_rejected",
     "word_accepted", "word_rejected", "submission_accepted", "submission_rejected", "unknown",
 ]
 KNOWN = {
     "sonnet.registration-accepted.v1": "registration_accepted",
     "sonnet.registration-rejected.v1": "registration_rejected",
+    "sonnet.application-rejected.v1": "application_rejected",
     "sonnet.team-setup.v1": "team_setup",
     "sonnet.roster-ready.v1": "roster_ready",
     "sonnet.word-accepted.v1": "word_accepted",
@@ -72,6 +73,15 @@ def receipt_candidate(room: str, raw: dict, referee_did: str) -> NormalizedRecei
                 return NormalizedReceipt("registration_rejected", payload)
 
         if room == ROOMS.discovery:
+            valid_application_rejection = (
+                isinstance(payload.get("request_id"), str)
+                and bool(payload["request_id"])
+                and payload.get("sender_did") == SARUKU_DID
+                and payload.get("status") == "rejected"
+                and payload.get("action_type") == "sonnet.application.v1"
+            )
+            if valid_application_rejection:
+                return NormalizedReceipt("application_rejected", payload)
             valid_roster_receipt = (
                 isinstance(payload.get("request_id"), str)
                 and bool(payload["request_id"])
@@ -96,6 +106,13 @@ def receipt_candidate(room: str, raw: dict, referee_did: str) -> NormalizedRecei
 def receipt_matches(receipt: NormalizedReceipt, pending: dict[str, Any]) -> bool:
     if receipt.kind == "unknown":
         return False
+    if receipt.kind == "application_rejected":
+        return (
+            pending.get("type") == "sonnet.application.v1"
+            and receipt.payload.get("contest_id") == CONTEST_ID
+            and receipt.payload.get("request_id") == pending.get("request_id")
+            and receipt.payload.get("sender_did") == SARUKU_DID
+        )
     if receipt.kind in {"roster_consent_accepted", "roster_ready", "roster_rejected"}:
         return (
             pending.get("type") == "sonnet.roster.v1"
@@ -120,6 +137,7 @@ def normalize_llm_receipt(value: Any) -> NormalizedReceipt:
     required = {
         "registration_accepted": {"request_id"},
         "registration_rejected": {"request_id"},
+        "application_rejected": {"request_id"},
         "team_setup": {"request_id", "game_id", "poem_room", "room_generation"},
         "roster_consent_accepted": {"request_id"},
         "roster_ready": {"request_id", "game_id", "poem_room", "room_generation", "members"},

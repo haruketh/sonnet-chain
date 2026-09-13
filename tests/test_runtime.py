@@ -1,10 +1,11 @@
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from sonnet_chain.config import Config, SARUKU_DID
+from sonnet_chain.config import CONTEST_ID, Config, ROOMS, SARUKU_DID
 from sonnet_chain.daemon import Daemon
 from sonnet_chain.decision import deterministic_team_decision
 from sonnet_chain.discovery import TeamCandidate, normalize_llm_candidates, parse_protocol_candidate
@@ -15,6 +16,9 @@ from sonnet_chain.publisher import CommandPublisher, PublisherUnavailable, canon
 from sonnet_chain.receipts import normalize_llm_receipt, receipt_candidate
 from sonnet_chain.signing import Signer, did_of, verify_room_signature
 from sonnet_chain.state import Phase, StateStore
+from sonnet_chain.team_formation import (
+    ApplicationDelivery, FormationOpportunity, formation_watchdog, start_epoch,
+)
 from sonnet_chain.teams import score_team, valid_roster
 
 
@@ -216,6 +220,26 @@ def test_previous_contributor_saruku_makes_no_proposal(tmp_path: Path):
 def test_openai_failure_is_safe_without_key():
     with pytest.raises(LLMUnavailable):
         LLMClient(None, "test").structured("decide", {}, "x", {"type": "object"})
+
+
+def test_trusted_application_rejection_is_authoritative():
+    referee_key = Ed25519PrivateKey.generate()
+    referee = did_of(referee_key)
+    raw = signed(referee_key, ROOMS.discovery, {
+        "type": "sonnet.receipt.v1", "contest_id": CONTEST_ID,
+        "request_id": "application-1", "sender_did": SARUKU_DID,
+        "action_type": "sonnet.application.v1", "status": "rejected",
+    })
+    receipt = receipt_candidate(ROOMS.discovery, raw, referee)
+    assert receipt is not None and receipt.kind == "application_rejected"
+
+
+def test_absence_or_timeout_is_not_explicit_non_persistence():
+    now = datetime.now(timezone.utc)
+    item = start_epoch(FormationOpportunity("g", "did:key:zLead", 1, now), "app", now)
+    assert item.application_delivery_state == ApplicationDelivery.POSTED_UNCONFIRMED
+    assert formation_watchdog(item, now + timedelta(minutes=10)) == "APPLICATION_DELIVERY_UNKNOWN"
+    assert item.application_delivery_state != ApplicationDelivery.EXPLICITLY_NOT_PERSISTED
 
 
 def test_unknown_referee_receipt_does_not_transition():

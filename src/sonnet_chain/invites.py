@@ -10,7 +10,7 @@ from .config import CONTEST_ID, ROOMS, SARUKU_DID
 from .launch import DID_KEY, owner_did
 from .signing import verify_room_signature
 
-INVITE_TYPES = {"sonnet.note.v1", "sonnet.invite.v1", "sonnet.invite.v2"}
+INVITE_TYPES = {"sonnet.note.v1"}
 
 
 @dataclass(frozen=True)
@@ -79,7 +79,8 @@ def choose_invite(candidates: Iterable[InviteCandidate]) -> DirectInvite | None:
 
 
 def direct_invite(
-    record: dict[str, Any], target_did: str = SARUKU_DID, room: str = ROOMS.discovery
+    record: dict[str, Any], target_did: str = SARUKU_DID, room: str = ROOMS.discovery,
+    trusted_writer_dids: set[str] | None = None,
 ) -> DirectInvite | None:
     sender = record.get("from")
     if not isinstance(sender, str) or not DID_KEY.fullmatch(sender) or sender == target_did:
@@ -96,7 +97,8 @@ def direct_invite(
         return None
     if payload.get("contest_id") != CONTEST_ID or payload.get("target_did") != target_did:
         return None
-    if payload.get("role") not in {None, "writer"}:
+    # A self-declared payload role is never recruiter authority.
+    if trusted_writer_dids is None or sender not in trusted_writer_dids:
         return None
     if payload.get("status") in {"started", "frozen", "closed"}:
         return None
@@ -123,7 +125,7 @@ def direct_invite(
     except (TypeError, ValueError):
         seq = 0
     lead = payload.get("team_lead_did", payload.get("lead_did"))
-    explicit_offer_rank = 2 if payload["type"] in {"sonnet.invite.v1", "sonnet.invite.v2"} else 1
+    explicit_offer_rank = 1
     return DirectInvite(
         game_id, sender, poem_room, generation, explicit_offer_rank,
         isinstance(lead, str) and lead == sender, _message_time(record), seq,
@@ -354,8 +356,10 @@ def application_expiry_reason(
         return None
     if age >= 60:
         return "hard_timeout"
-    if age >= 20 and better_candidate_available:
-        return "better_candidate_available"
+    # v0.2 soft stall only triggers structural reevaluation. A challenger is
+    # handled by TeamFormationPolicy and never expires an epoch merely by
+    # existing.
+    _ = better_candidate_available
     return None
 
 

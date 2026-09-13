@@ -24,6 +24,21 @@ def test_gap_uses_export_and_preserves_generation():
     assert generation == 7
 
 
+def test_explicit_export_history_supports_policy_gap_repair():
+    rows = "\n".join(json.dumps({"seq": i, "from": "x", "text": str(i)}) for i in range(4, 7))
+    tc = Technocore("https://example.test")
+    tc.client.close()
+    tc.client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, text=rows, headers={"X-Room-Generation": "9"})
+    ))
+    try:
+        records, generation = tc.export_history("room")
+    finally:
+        tc.close()
+    assert [item.seq for item in records] == [4, 5, 6]
+    assert generation == 9
+
+
 def test_watch_retries_read_timeout_from_same_cursor(monkeypatch):
     seen_since = []
     calls = 0

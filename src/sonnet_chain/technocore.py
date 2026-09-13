@@ -83,6 +83,33 @@ class Technocore:
         generation = data.get("generation") if isinstance(data, dict) else None
         return records, generation if isinstance(generation, int) else None
 
+    def export_history(self, room: str) -> tuple[list[RoomRecord], int | None]:
+        """Fetch authoritative retained room history for explicit gap repair."""
+        response = self.client.get(f"{self.base_url}/r/{room}/export")
+        response.raise_for_status()
+        records: list[RoomRecord] = []
+        for line in response.text.splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            try:
+                seq = int(item.get("seq", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            text = item.get("text", "")
+            sender = item.get("from")
+            if seq > 0 and isinstance(text, str):
+                records.append(RoomRecord(seq, sender if isinstance(sender, str) else None, text, item))
+        generation_raw = response.headers.get("X-Room-Generation")
+        try:
+            generation = int(generation_raw) if generation_raw is not None else None
+        except ValueError:
+            generation = None
+        return records, generation
+
     def owner_note(self, room: str) -> Any | None:
         r = self.client.get(f"{self.base_url}/kv/room-owners/{room}")
         if r.status_code == 404:

@@ -175,11 +175,12 @@ def roster_consensus(
         if anchor_signer is None:
             ready_now = set(candidate.members) - {saruku_did} <= signers
         else:
-            # Early consent is allowed only when the DID that invited Saruku
-            # currently signs this exact canonical roster, and that anchor
-            # signature belongs to this application epoch.
+            # v0.2 keeps Saruku as the last signer. The inviter anchors the
+            # application epoch, but does not substitute for the other current
+            # consents on the exact canonical roster.
             ready_now = (
                 anchor_signer in signers
+                and set(candidate.members) - {saruku_did} <= signers
                 and (
                     min_anchor_seq is None
                     or current_seq.get(anchor_signer, 0) > min_anchor_seq

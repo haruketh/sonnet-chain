@@ -7,6 +7,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterator
 
+from .config import ROOMS
+
 
 class Phase(StrEnum):
     WAIT_LAUNCH = "WAIT_LAUNCH"
@@ -82,6 +84,37 @@ class StateStore:
               reducer_version INTEGER NOT NULL, ledger_high_watermark TEXT NOT NULL,
               payload_json TEXT NOT NULL, rebuilt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS formation_history_state (
+              room TEXT NOT NULL, generation INTEGER NOT NULL,
+              complete_from_seq INTEGER, complete_through_seq INTEGER NOT NULL DEFAULT 0,
+              highest_observed_seq INTEGER NOT NULL DEFAULT 0,
+              gap_ranges_json TEXT NOT NULL DEFAULT '[]',
+              reconciliation_required INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(room,generation)
+            );
+            CREATE TABLE IF NOT EXISTS formation_epochs (
+              epoch_id TEXT PRIMARY KEY, game_id TEXT NOT NULL, inviter_did TEXT NOT NULL,
+              payload_json TEXT NOT NULL, status TEXT NOT NULL,
+              active INTEGER NOT NULL DEFAULT 1,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_formation_epoch
+              ON formation_epochs(active) WHERE active=1;
+            CREATE TABLE IF NOT EXISTS formation_opportunities (
+              opportunity_id TEXT PRIMARY KEY, game_id TEXT NOT NULL,
+              inviter_did TEXT NOT NULL, source_seq INTEGER NOT NULL,
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS protocol_outbox (
+              request_id TEXT PRIMARY KEY, action_kind TEXT NOT NULL,
+              room TEXT NOT NULL, game_id TEXT,
+              roster_fingerprint TEXT, payload_json TEXT NOT NULL,
+              delivery_state TEXT NOT NULL, created_at TEXT NOT NULL,
+              reconcile_started_at TEXT, reconcile_deadline TEXT,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         self.db.commit()
@@ -93,6 +126,28 @@ class StateStore:
                 "ALTER TABLE team_events ADD COLUMN source_ordinal INTEGER NOT NULL DEFAULT 0"
             )
             self.db.commit()
+        # Conservative v0.2 bootstrap: a legacy pending official mutation may
+        # already have crossed the network boundary. Absence of a new table row
+        # is not evidence that consent/withdrawal was never attempted.
+        legacy = self.db.execute(
+            "SELECT request_id,kind,payload,created_at FROM requests "
+            "WHERE status IN ('pending','posted') AND kind IN ('roster','withdraw')"
+        ).fetchall()
+        with self.db:
+            for row in legacy:
+                payload = json.loads(row["payload"])
+                action = row["kind"]
+                delivery = (
+                    "CONSENT_DELIVERY_UNKNOWN" if action == "roster"
+                    else "DELIVERY_UNKNOWN"
+                )
+                self.db.execute(
+                    "INSERT OR IGNORE INTO protocol_outbox("
+                    "request_id,action_kind,room,game_id,payload_json,delivery_state,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (row["request_id"], action, ROOMS.discovery,
+                     payload.get("game_id"), row["payload"], delivery, row["created_at"]),
+                )
         defaults = {
             "phase": Phase.WAIT_LAUNCH.value,
             "trusted_launch": None,
@@ -222,3 +277,72 @@ class StateStore:
             return False
         self.set("active_team", game_id)
         return True
+
+    def persist_protocol_intent(
+        self, request_id: str, action_kind: str, room: str, payload: dict,
+        delivery_state: str, *, game_id: str | None = None,
+        roster_fingerprint: str | None = None, created_at: str,
+        reconcile_started_at: str | None = None,
+        reconcile_deadline: str | None = None,
+    ) -> bool:
+        """Durably freeze an outbound mutation before any network side effect."""
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        with self.db:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO protocol_outbox("
+                "request_id,action_kind,room,game_id,roster_fingerprint,payload_json,"
+                "delivery_state,created_at,reconcile_started_at,reconcile_deadline) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (request_id, action_kind, room, game_id, roster_fingerprint, encoded,
+                 delivery_state, created_at, reconcile_started_at, reconcile_deadline),
+            )
+        if cur.rowcount == 1:
+            return True
+        existing = self.protocol_intent(request_id)
+        if (
+            existing is None or existing["action_kind"] != action_kind
+            or existing["room"] != room or existing["payload"] != payload
+            or existing["game_id"] != game_id
+            or existing["roster_fingerprint"] != roster_fingerprint
+        ):
+            raise ValueError("request_id is already bound to a different protocol intent")
+        return False
+
+    def protocol_intent(self, request_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM protocol_outbox WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value["payload"] = json.loads(value.pop("payload_json"))
+        return value
+
+    def unresolved_protocol_intent(self, action_kind: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT request_id FROM protocol_outbox WHERE action_kind=? AND "
+            "delivery_state IN ('POSTED_UNCONFIRMED','DELIVERY_UNKNOWN',"
+            "'CONSENT_POSTED_UNCONFIRMED','CONSENT_DELIVERY_UNKNOWN') "
+            "ORDER BY created_at LIMIT 1", (action_kind,),
+        ).fetchone()
+        return None if row is None else self.protocol_intent(row["request_id"])
+
+    def set_protocol_delivery(self, request_id: str, delivery_state: str) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE protocol_outbox SET delivery_state=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE request_id=?", (delivery_state, request_id),
+            )
+
+    def trusted_writer_dids(self) -> set[str]:
+        """Writer roles derived only from accepted, verified referee receipts."""
+        rows = self.db.execute(
+            "SELECT payload FROM receipts WHERE kind='registration_accepted' AND accepted=1"
+        ).fetchall()
+        writers: set[str] = set()
+        for row in rows:
+            payload = json.loads(row["payload"])
+            did = payload.get("participant_did", payload.get("sender_did"))
+            if payload.get("role") == "writer" and isinstance(did, str):
+                writers.add(did)
+        return writers

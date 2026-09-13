@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -18,9 +18,8 @@ from .decision import (
 from .launch import TrustedLaunch, owner_did, verify_launch_record
 from .journal import Journal
 from .invites import (
-    InviteCandidate,
+    InviteCandidate, PendingApplication,
     application_age_minutes,
-    application_blocks_invite,
     application_expiry_reason,
     choose_invite,
     direct_invite,
@@ -35,10 +34,21 @@ from .poetry import PoemState, build_word_index
 from .protocol import discovery_advertisement, register_writer, request_id, submit, team_application, withdraw, word
 from .publisher import CommandPublisher, PublisherAuthRequired, PublisherUnavailable, canonical_poem
 from .receipts import normalize_llm_receipt, receipt_candidate, receipt_matches
-from .rosters import CanonicalRoster, current_roster_signers, roster_consensus, signed_roster, team_room_is_open
+from .rosters import (
+    CanonicalRoster, current_roster_signers, roster_consensus, signed_roster,
+    signed_withdrawal, team_room_is_open,
+)
 from .state import Phase, StateStore
 from .team_intelligence import TeamIntelligence, capability_announcement
 from .technocore import Technocore
+from .signing import verify_room_signature
+from .team_formation import (
+    ApplicationDelivery, ConsentDelivery, FormationHistoryState, FormationOpportunity,
+    FormationStage, TeamFormationStore,
+    StructuralKey, formation_decision, formation_watchdog, materially_stronger,
+    reduce_candidate_states, roster_fingerprint, start_epoch,
+    targeted_recruitment_note,
+)
 from .writing import WritingPlanner, build_writing_context, validate_writing_candidate
 
 def before_deadline(store: StateStore) -> bool:
@@ -104,7 +114,64 @@ class Daemon:
         for record in records:
             if self.state.record_event(room, record.seq, generation, record.raw):
                 fresh.append(record.raw)
+        if generation is not None:
+            rows = self.state.db.execute(
+                "SELECT seq FROM events WHERE room=? AND generation=? ORDER BY seq",
+                (room, generation),
+            ).fetchall()
+            history = FormationHistoryState(room, generation)
+            history.observe(row["seq"] for row in rows)
+            TeamFormationStore(self.state).save_history(history)
+            if history.reconciliation_required:
+                self._journal(
+                    "formation_history_gap_detected", room=room, generation=generation,
+                    gap_ranges=[{"start": gap.start, "end": gap.end} for gap in history.gap_ranges],
+                    reason_code="missing_sequence_interval",
+                )
         return fresh
+
+    def _reconcile_history(
+        self, room: str, generation: int, start_seq: int, end_seq: int,
+    ) -> bool:
+        """Actively repair a required interval, then recompute continuity."""
+        formation = TeamFormationStore(self.state)
+        try:
+            records, exported_generation = self.tc.export_history(room)
+            if exported_generation is not None and exported_generation != generation:
+                raise RuntimeError("authoritative export generation changed")
+            for record in records:
+                self.state.record_event(room, record.seq, generation, record.raw)
+            rows = self.state.db.execute(
+                "SELECT seq FROM events WHERE room=? AND generation=? ORDER BY seq",
+                (room, generation),
+            ).fetchall()
+            history = FormationHistoryState(room, generation)
+            history.observe(row["seq"] for row in rows)
+            formation.save_history(history)
+            complete = history.is_complete(start_seq, end_seq)
+        except Exception as exc:
+            history = formation.load_history(room, generation) or FormationHistoryState(room, generation)
+            history.reconciliation_required = True
+            formation.save_history(history)
+            self._journal(
+                "formation_history_reconcile_failed", room=room, generation=generation,
+                reason_code=f"export_{type(exc).__name__}",
+                history_complete_through_seq=history.complete_through_seq,
+            )
+            return False
+        if complete:
+            self._journal(
+                "formation_history_reconciled", room=room, generation=generation,
+                reason_code="required_interval_complete", start_seq=start_seq,
+                end_seq=end_seq, history_complete_through_seq=history.complete_through_seq,
+            )
+            return True
+        self._journal(
+            "formation_history_reconcile_failed", room=room, generation=generation,
+            reason_code="export_still_incomplete", start_seq=start_seq, end_seq=end_seq,
+            history_complete_through_seq=history.complete_through_seq,
+        )
+        return False
 
     def _verify_local_launch(self, launch: TrustedLaunch) -> dict:
         manifest = self.cfg.official_dir / "manifest.json"
@@ -120,6 +187,322 @@ class Daemon:
         if not cache.exists():
             build_word_index(self.cfg.official_dir / "cmudict.dict", cache)
         return contest
+
+    def _trusted_writer_dids(self) -> set[str]:
+        referee = self.state.get("referee_did")
+        if not isinstance(referee, str):
+            return set()
+        writers = self.state.trusted_writer_dids()
+        for raw in self.state.events(ROOMS.registration):
+            receipt = receipt_candidate(ROOMS.registration, raw, referee)
+            if receipt is None or receipt.kind != "registration_accepted":
+                continue
+            did = receipt.payload.get("participant_did", receipt.payload.get("sender_did"))
+            if receipt.payload.get("role") == "writer" and isinstance(did, str):
+                writers.add(did)
+        return writers
+
+    def _formation_invite_blocked(self, invite: Any) -> bool:
+        rows = self.state.db.execute(
+            "SELECT payload_json,active FROM formation_epochs WHERE game_id=?",
+            (invite.game_id,),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if bool(row["active"]):
+                return True
+            prior_seq = payload.get("starting_invite_seq")
+            if isinstance(prior_seq, int) and invite.seq <= prior_seq:
+                return True
+        return False
+
+    def _reconcile_formation_transport(self) -> None:
+        formation = TeamFormationStore(self.state)
+        epoch = formation.active_epoch()
+        if epoch is None:
+            return
+        records = self.state.events(ROOMS.discovery)
+        withdraw_intent = self.state.unresolved_protocol_intent("withdraw")
+        if withdraw_intent is not None and epoch.withdraw_pending:
+            for raw in records:
+                if signed_withdrawal(raw) != (epoch.game_id, SARUKU_DID):
+                    continue
+                try:
+                    payload = json.loads(raw["text"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                if payload.get("request_id") != withdraw_intent["request_id"]:
+                    continue
+                self.state.set_protocol_delivery(withdraw_intent["request_id"], "CONFIRMED")
+                self.state.set_request_status(withdraw_intent["request_id"], "accepted")
+                epoch.withdraw_pending = False
+                epoch.status = "abandoned"
+                formation.save_epoch(epoch, active=False)
+                self.state.set("active_team", None)
+                self._journal(
+                    "formation_withdraw_reconciled", game_id=epoch.game_id,
+                    epoch_id=epoch.epoch_id, request_id=withdraw_intent["request_id"],
+                    reason_code="exact_discovery_readback",
+                )
+                self._journal(
+                    "formation_epoch_ended", game_id=epoch.game_id,
+                    epoch_id=epoch.epoch_id, reason_code="withdraw_confirmed",
+                )
+                return
+        found: dict[str, Any] | None = None
+        for raw in records:
+            if raw.get("from") != SARUKU_DID or not verify_room_signature(
+                ROOMS.discovery, SARUKU_DID, raw.get("nonce", ""),
+                raw.get("text", ""), raw.get("sig", ""),
+            ):
+                continue
+            try:
+                payload = json.loads(raw["text"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and payload.get("request_id") == epoch.application_request_id:
+                found = raw
+                break
+        if found is not None and epoch.application_delivery_state == ApplicationDelivery.POSTED_UNCONFIRMED:
+            stamp = record_time(found)
+            if stamp is not None:
+                epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+                epoch.application_source_seq = int(found.get("seq", 0) or 0)
+                epoch.application_observed_at = stamp.isoformat()
+                formation.save_epoch(epoch)
+                self.state.set_protocol_delivery(epoch.application_request_id, ApplicationDelivery.CONFIRMED)
+                self._journal(
+                    "formation_application_confirmed", game_id=epoch.game_id,
+                    request_id=epoch.application_request_id,
+                    source_seq=epoch.application_source_seq,
+                    reason_code="trusted_discovery_readback",
+                )
+            return
+        if epoch.application_delivery_state == ApplicationDelivery.POSTED_UNCONFIRMED:
+            deadline = datetime.fromisoformat(epoch.application_reconcile_deadline)
+            if datetime.now(timezone.utc) >= deadline:
+                epoch.application_delivery_state = ApplicationDelivery.DELIVERY_UNKNOWN
+                epoch.status = "abandoned_unconfirmed"
+                formation.save_epoch(epoch, active=False)
+                self.state.set_protocol_delivery(epoch.application_request_id, ApplicationDelivery.DELIVERY_UNKNOWN)
+                self.state.set_request_status(epoch.application_request_id, "delivery_unknown")
+                self._journal(
+                    "formation_application_delivery_unknown", game_id=epoch.game_id,
+                    request_id=epoch.application_request_id,
+                    reason_code="reconcile_deadline_elapsed",
+                )
+                self._journal(
+                    "team_application_expired", game_id=epoch.game_id,
+                    request_id=epoch.application_request_id, reason="delivery_unknown",
+                )
+                self._journal(
+                    "formation_epoch_ended", game_id=epoch.game_id,
+                    reason_code="abandoned_unconfirmed",
+                )
+
+    def _bootstrap_formation_state(self) -> None:
+        formation = TeamFormationStore(self.state)
+        if formation.active_epoch() is not None:
+            return
+        phase = self.state.phase
+        if phase not in {Phase.DISCOVERY, Phase.WAIT_ROSTER_READY}:
+            return
+        row = self.state.db.execute(
+            "SELECT request_id,kind,payload,status,created_at FROM requests "
+            "WHERE (kind LIKE 'application:%' OR kind='roster' OR kind='withdraw') "
+            "AND status IN ('pending','posted') ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        roster_intent = self.state.unresolved_protocol_intent("roster")
+        withdraw_intent = self.state.unresolved_protocol_intent("withdraw")
+        if row is None and roster_intent is None and withdraw_intent is None:
+            return
+        payload = json.loads(row["payload"]) if row is not None else (
+            roster_intent or withdraw_intent
+        )["payload"]
+        game_id = payload.get("game_id")
+        if not isinstance(game_id, str):
+            return
+        opportunities = []
+        trusted = self._trusted_writer_dids()
+        for raw in self.state.events(ROOMS.discovery):
+            opportunity = targeted_recruitment_note(raw, trusted)
+            if opportunity is not None and opportunity.game_id == game_id:
+                opportunities.append(opportunity)
+        opportunity = max(opportunities, key=lambda item: item.source_seq, default=None)
+        inviter = opportunity.inviter_did if opportunity is not None else "did:key:zUnknown"
+        source_seq = opportunity.source_seq if opportunity is not None else 0
+        created_raw = row["created_at"] if row is not None else (
+            roster_intent or withdraw_intent
+        )["created_at"]
+        try:
+            created = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except ValueError:
+            created = datetime.now(timezone.utc)
+        if row is not None and row["kind"] == "roster" and roster_intent is None:
+            roster_intent = self.state.protocol_intent(row["request_id"])
+        if row is not None and row["kind"] == "roster" and roster_intent is None:
+            self.state.persist_protocol_intent(
+                row["request_id"], "roster", ROOMS.discovery, payload,
+                ConsentDelivery.CONSENT_DELIVERY_UNKNOWN,
+                game_id=game_id, created_at=created.isoformat(),
+            )
+            roster_intent = self.state.protocol_intent(row["request_id"])
+        if row is not None and row["kind"] == "withdraw" and withdraw_intent is None:
+            withdraw_intent = self.state.protocol_intent(row["request_id"])
+        if row is not None and row["kind"] == "withdraw" and withdraw_intent is None:
+            self.state.persist_protocol_intent(
+                row["request_id"], "withdraw", ROOMS.discovery, payload,
+                "DELIVERY_UNKNOWN", game_id=game_id, created_at=created.isoformat(),
+            )
+            withdraw_intent = self.state.protocol_intent(row["request_id"])
+        application_request = (
+            row["request_id"] if row is not None and str(row["kind"]).startswith("application:")
+            else f"legacy-{game_id}-{source_seq}"
+        )
+        epoch = start_epoch(
+            FormationOpportunity(game_id, inviter, source_seq, created),
+            application_request, created,
+        )
+        if row is None or not str(row["kind"]).startswith("application:"):
+            epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+            epoch.application_observed_at = created.isoformat()
+        if roster_intent is not None:
+            epoch.consent_delivery_state = ConsentDelivery(roster_intent["delivery_state"])
+            epoch.consent_request_id = roster_intent["request_id"]
+            epoch.consent_roster_fingerprint = roster_intent.get("roster_fingerprint")
+            epoch.formation_stage = FormationStage.CONSENT_RECONCILING
+        if withdraw_intent is not None:
+            epoch.withdraw_pending = True
+            epoch.withdraw_request_id = withdraw_intent["request_id"]
+            if epoch.consent_delivery_state == ConsentDelivery.NOT_SENT:
+                epoch.consent_delivery_state = ConsentDelivery.CONSENT_DELIVERY_UNKNOWN
+            epoch.formation_stage = FormationStage.WAIT_ROSTER_READY
+        formation.save_epoch(epoch)
+        self._journal(
+            "formation_epoch_started", game_id=game_id, epoch_id=epoch.epoch_id,
+            request_id=application_request, reason_code="durable_history_reconstruction",
+        )
+
+    def _reduce_epoch_structure(
+        self, epoch: Any, discovery_events: list[dict[str, Any]],
+    ) -> datetime | None:
+        relevant = []
+        for raw in discovery_events:
+            parsed = signed_roster(raw)
+            withdrawn = signed_withdrawal(raw)
+            if (
+                (parsed is not None and parsed[0].game_id == epoch.game_id)
+                or (withdrawn is not None and withdrawn[0] == epoch.game_id)
+            ):
+                relevant.append(raw)
+        latest_activity_seq = max(
+            (int(item.get("seq", 0) or 0) for item in relevant), default=0
+        )
+        activity_key = f"formation_activity_seq:{epoch.epoch_id}"
+        prior_activity_seq = int(self.state.get(activity_key, 0) or 0)
+        if latest_activity_seq > prior_activity_seq:
+            self.state.set(activity_key, latest_activity_seq)
+            self._journal(
+                "formation_activity", game_id=epoch.game_id,
+                epoch_id=epoch.epoch_id, source_seq=latest_activity_seq,
+                reason_code="verified_formation_event",
+            )
+            for raw in relevant:
+                seq = int(raw.get("seq", 0) or 0)
+                if seq <= prior_activity_seq:
+                    continue
+                parsed = signed_roster(raw)
+                withdrawn = signed_withdrawal(raw)
+                if parsed is not None:
+                    self._journal(
+                        "formation_consent_changed", game_id=epoch.game_id,
+                        epoch_id=epoch.epoch_id, source_seq=seq,
+                        reason_code="latest_action_roster",
+                    )
+                elif withdrawn is not None:
+                    self._journal(
+                        "formation_consent_withdrawn", game_id=epoch.game_id,
+                        epoch_id=epoch.epoch_id, source_seq=seq,
+                        reason_code="latest_action_withdrawal",
+                    )
+        candidates: list[tuple[tuple[Any, ...], CanonicalRoster, StructuralKey, datetime, int]] = []
+        seen: set[CanonicalRoster] = set()
+        for raw in discovery_events:
+            parsed = signed_roster(raw)
+            if parsed is None or parsed[0] in seen:
+                continue
+            roster = parsed[0]
+            if roster.game_id != epoch.game_id or SARUKU_DID not in roster.members:
+                continue
+            seen.add(roster)
+            signers = current_roster_signers(discovery_events, roster)
+            missing = len(set(roster.members) - set(signers))
+            ready = set(roster.members) - {SARUKU_DID} <= set(signers)
+            stage = FormationStage.READY_TO_COUNTERSIGN if ready else (
+                FormationStage.ROSTER_PROGRESSING if len(signers) > 1
+                else FormationStage.ROSTER_PROPOSED
+            )
+            key = StructuralKey(
+                int({value: rank for rank, value in enumerate(FormationStage)}[stage]),
+                True, True, epoch.inviter_did in signers, missing, len(signers),
+            )
+            related = [
+                item for item in discovery_events
+                if (parsed_item := signed_roster(item)) is not None
+                and parsed_item[0] == roster and parsed_item[1] in signers
+            ]
+            stamps = [(record_time(item), int(item.get("seq", 0) or 0)) for item in related]
+            stamps = [(stamp, seq) for stamp, seq in stamps if stamp is not None]
+            at, seq = max(stamps, default=(datetime.now(timezone.utc), 0))
+            candidates.append((key.comparison(), roster, key, at, seq))
+        if not candidates:
+            return None
+        _, roster, key, at, seq = max(candidates, key=lambda item: item[0])
+        previous_hwm = tuple(epoch.epoch_high_watermark_key) if epoch.epoch_high_watermark_key else None
+        previous_fingerprint = epoch.active_roster_fingerprint
+        lineage_progress, epoch_progress = epoch.observe_lineage(
+            roster_fingerprint(roster), key, at, seq
+        )
+        if (
+            previous_fingerprint is not None
+            and previous_fingerprint != epoch.active_roster_fingerprint
+        ):
+            self._journal(
+                "formation_replacement_started", game_id=epoch.game_id,
+                epoch_id=epoch.epoch_id, source_seq=seq,
+                roster_fingerprint=epoch.active_roster_fingerprint,
+                reason_code="different_current_roster_lineage",
+            )
+        if epoch_progress:
+            epoch.formation_stage = FormationStage(
+                list(FormationStage)[key.stage_rank]
+            )
+            TeamFormationStore(self.state).save_epoch(epoch)
+            self._journal(
+                "formation_progress", game_id=epoch.game_id, source_seq=seq,
+                structural_key=list(key.comparison()), reason_code="strict_hwm_improvement",
+            )
+        elif lineage_progress:
+            TeamFormationStore(self.state).save_epoch(epoch)
+            self._journal(
+                "formation_replacement_progress", game_id=epoch.game_id,
+                source_seq=seq, reason_code="lineage_local_improvement",
+            )
+        elif previous_hwm is not None and key.comparison() < previous_hwm:
+            regression_key = f"formation_regression_seq:{epoch.epoch_id}"
+            if int(self.state.get(regression_key, 0) or 0) < seq:
+                self.state.set(regression_key, seq)
+                self._journal(
+                    "formation_regression", game_id=epoch.game_id,
+                    epoch_id=epoch.epoch_id, source_seq=seq,
+                    current_structural_key=list(key.comparison()),
+                    reason_code="below_epoch_high_watermark",
+                )
+        if epoch.epoch_high_watermark_at:
+            return datetime.fromisoformat(epoch.epoch_high_watermark_at)
+        return None
 
     def _wait_launch(self) -> None:
         owner = owner_did(self.tc.owner_note(self.cfg.rules_room))
@@ -230,9 +613,34 @@ class Daemon:
                 self.state.phase = Phase.DISCOVERY
             elif receipt.kind == "registration_rejected":
                 self.state.set_request_status(request_id, "rejected")
+            elif receipt.kind == "application_rejected":
+                self.state.set_request_status(request_id, "rejected")
+                self.state.set_protocol_delivery(
+                    request_id, ApplicationDelivery.EXPLICITLY_NOT_PERSISTED
+                )
+                epoch = TeamFormationStore(self.state).active_epoch()
+                if epoch is not None and epoch.application_request_id == request_id:
+                    epoch.application_delivery_state = ApplicationDelivery.EXPLICITLY_NOT_PERSISTED
+                    epoch.status = "invalid"
+                    TeamFormationStore(self.state).save_epoch(epoch, active=False)
+                    self._journal(
+                        "formation_epoch_ended", game_id=epoch.game_id,
+                        epoch_id=epoch.epoch_id,
+                        reason_code="trusted_application_rejection",
+                    )
             elif receipt.kind == "roster_consent_accepted":
                 self.state.set_request_status(request_id, "accepted")
                 self.state.set("roster_consent_accepted", True)
+                self.state.set_protocol_delivery(request_id, ConsentDelivery.CONSENT_CONFIRMED)
+                epoch = TeamFormationStore(self.state).active_epoch()
+                if epoch is not None and epoch.consent_request_id == request_id:
+                    epoch.consent_delivery_state = ConsentDelivery.CONSENT_CONFIRMED
+                    epoch.formation_stage = FormationStage.WAIT_ROSTER_READY
+                    TeamFormationStore(self.state).save_epoch(epoch)
+                self._journal(
+                    "formation_consent_confirmed", request_id=request_id,
+                    game_id=pending.get("game_id"), reason_code="trusted_referee_receipt",
+                )
             elif receipt.kind == "roster_ready":
                 state_hash = receipt.payload.get("state_hash")
                 if not isinstance(state_hash, str) or not state_hash:
@@ -252,10 +660,24 @@ class Daemon:
                 self.state.set("poem_state_hash", state_hash)
                 self.state.set("poem_last_progress_at", datetime.now(timezone.utc).isoformat())
                 self.state.set("roster_ready", True)
+                self.state.set_protocol_delivery(request_id, ConsentDelivery.CONSENT_CONFIRMED)
+                epoch = TeamFormationStore(self.state).active_epoch()
+                if epoch is not None:
+                    epoch.consent_delivery_state = ConsentDelivery.CONSENT_CONFIRMED
+                    epoch.formation_stage = FormationStage.TEAM_READY
+                    epoch.status = "team_ready"
+                    TeamFormationStore(self.state).save_epoch(epoch, active=False)
                 self._clear_roster_wait_state()
                 self.state.phase = Phase.WRITING
             elif receipt.kind == "roster_rejected":
                 self.state.set_request_status(request_id, "rejected")
+                self.state.set_protocol_delivery(
+                    request_id, ConsentDelivery.CONSENT_EXPLICITLY_NOT_PERSISTED
+                )
+                epoch = TeamFormationStore(self.state).active_epoch()
+                if epoch is not None and epoch.consent_request_id == request_id:
+                    epoch.consent_delivery_state = ConsentDelivery.CONSENT_EXPLICITLY_NOT_PERSISTED
+                    TeamFormationStore(self.state).save_epoch(epoch)
                 self.state.set("active_team", None)
                 self.state.set("team_setup", None)
                 self._clear_roster_wait_state()
@@ -285,7 +707,29 @@ class Daemon:
                 self.state.set("submission_state", "rejected")
 
     def _discovery(self) -> None:
-        self._read(ROOMS.discovery)
+        # Trusted referee terminal facts are processed before every local
+        # formation heuristic.
+        self._receipts(ROOMS.discovery)
+        if self.state.phase != Phase.DISCOVERY:
+            return
+        # Recruitment authority comes from referee-accepted registration
+        # evidence, never from a note's self-declared role.
+        self._read(ROOMS.registration)
+        self._bootstrap_formation_state()
+        self._reconcile_formation_transport()
+        active_epoch = TeamFormationStore(self.state).active_epoch()
+        if active_epoch is not None and (
+            active_epoch.possibly_consented or active_epoch.withdraw_pending
+        ):
+            self.state.set("last_error", "Roster consent delivery unresolved; reconciling fail-closed")
+            return
+        if (
+            active_epoch is not None
+            and active_epoch.application_delivery_state == ApplicationDelivery.POSTED_UNCONFIRMED
+        ):
+            # Application transport is still within its fixed reconciliation
+            # window. Never create a second active application.
+            return
         if not self.state.get("registered") or not before_deadline(self.state):
             return
         if self.state.active_team() is None and self.cfg.x_account_url:
@@ -311,40 +755,97 @@ class Daemon:
                 if SARUKU_DID in parsed[0].members
             }
             pending_app = pending_application(journal_path)
+            if pending_app is not None and active_epoch is None:
+                durable = self.state.db.execute(
+                    "SELECT 1 FROM requests WHERE request_id=? AND kind LIKE 'application:%' "
+                    "AND status IN ('pending','posted')",
+                    (pending_app.request_id,),
+                ).fetchone()
+                if durable is None:
+                    pending_app = None
+            if active_epoch is not None and active_epoch.status == "active":
+                observed = None
+                if active_epoch.application_observed_at:
+                    observed = datetime.fromisoformat(active_epoch.application_observed_at)
+                pending_app = PendingApplication(
+                    active_epoch.game_id, active_epoch.application_request_id, observed,
+                    invite_seq=active_epoch.starting_invite_seq,
+                    inviter_did=active_epoch.inviter_did,
+                )
             now = datetime.now(timezone.utc)
             progressed_at = None
             if pending_app is not None:
-                for item, parsed in parsed_rosters:
-                    if (
-                        parsed[0].game_id != pending_app.game_id
-                        or SARUKU_DID not in parsed[0].members
-                    ):
-                        continue
-                    stamp = record_time(item)
-                    if stamp is not None and (
-                        progressed_at is None or stamp > progressed_at
-                    ):
-                        progressed_at = stamp
+                if active_epoch is not None:
+                    progressed_at = self._reduce_epoch_structure(
+                        active_epoch, discovery_events
+                    )
+                else:
+                    for item, parsed in parsed_rosters:
+                        if parsed[0].game_id != pending_app.game_id or SARUKU_DID not in parsed[0].members:
+                            continue
+                        stamp = record_time(item)
+                        if stamp is not None and (progressed_at is None or stamp > progressed_at):
+                            progressed_at = stamp
             age = (
                 application_age_minutes(pending_app, now, progressed_at=progressed_at)
                 if pending_app is not None
                 else None
             )
+            history_unresolved = False
+            if (
+                pending_app is not None and age is not None and age >= 20
+                and discovery_generation is not None
+            ):
+                history = TeamFormationStore(self.state).load_history(
+                    ROOMS.discovery, discovery_generation
+                )
+                if history is not None:
+                    required_start = (
+                        active_epoch.starting_invite_seq
+                        if active_epoch is not None and active_epoch.starting_invite_seq
+                        else pending_app.invite_seq or 1
+                    )
+                    required_end = history.highest_observed_seq
+                    if not history.is_complete(required_start, required_end):
+                        history_unresolved = True
+                        if self._reconcile_history(
+                            ROOMS.discovery, discovery_generation,
+                            required_start, required_end,
+                        ):
+                            return self._discovery()
+                        if age < 60:
+                            return
+            # v0.2 soft stall is reevaluation only. Mere challenger presence at
+            # twenty minutes cannot abandon the current epoch.
             scan_candidates = pending_app is None or (
-                age is not None and age >= 20
+                age is not None and age >= 20 and not history_unresolved
             )
             selected = None
             if scan_candidates:
                 candidates = []
                 for event in discovery_events:
-                    invite = direct_invite(event)
+                    invite = direct_invite(event, trusted_writer_dids=self._trusted_writer_dids())
                     if invite is None:
                         continue
+                    opportunity = FormationOpportunity(
+                        invite.game_id, invite.from_did, invite.seq,
+                        datetime.fromtimestamp(invite.message_time, timezone.utc)
+                        if invite.message_time != float("-inf") else None,
+                        invite.poem_room, invite.room_generation,
+                    )
+                    if TeamFormationStore(self.state).save_opportunity(opportunity):
+                        self._journal(
+                            "formation_opportunity_observed", game_id=invite.game_id,
+                            source_seq=invite.seq, trusted_event_at=(
+                                opportunity.observed_at.isoformat()
+                                if opportunity.observed_at else None
+                            ), reason_code="trusted_targeted_recruitment_note",
+                        )
                     if pending_app is not None and invite.game_id == pending_app.game_id:
                         continue
                     if (
                         invite.game_id in signed_games
-                        or application_blocks_invite(journal_path, invite)
+                        or self._formation_invite_blocked(invite)
                         or self.state.pending_request(f"application:{invite.game_id}") is not None
                     ):
                         continue
@@ -360,18 +861,226 @@ class Daemon:
                         room_verified = True
                     candidates.append(InviteCandidate(invite, room_verified))
                 selected = choose_invite(candidates)
+                if pending_app is not None and selected is not None and age is not None and age < 60:
+                    opportunities = [
+                        FormationOpportunity(
+                            item.invite.game_id, item.invite.from_did, item.invite.seq,
+                            datetime.fromtimestamp(item.invite.message_time, timezone.utc)
+                            if item.invite.message_time != float("-inf") else None,
+                            item.invite.poem_room, item.invite.room_generation,
+                        ) for item in candidates
+                    ]
+                    verified_rooms = {
+                        (item.invite.poem_room, item.invite.room_generation): item.room_verified
+                        for item in candidates if item.invite.poem_room is not None
+                        and item.invite.room_generation is not None
+                    }
+                    reduced = reduce_candidate_states(
+                        discovery_events, opportunities, verified_rooms
+                    )
+                    referee = self.state.get("referee_did")
+                    if isinstance(referee, str):
+                        for candidate_state in reduced:
+                            roster = candidate_state.roster
+                            if roster is None or (
+                                roster.poem_room, roster.room_generation
+                            ) in verified_rooms:
+                                continue
+                            owner = self.tc.owner_note(roster.poem_room)
+                            room_records, actual_generation = self.tc.read_page(
+                                roster.poem_room, 0, 0
+                            )
+                            verified_rooms[(roster.poem_room, roster.room_generation)] = team_room_is_open(
+                                roster, referee, owner, actual_generation, room_records
+                            )
+                        reduced = reduce_candidate_states(
+                            discovery_events, opportunities, verified_rooms
+                        )
+                    challenger = max(
+                        reduced, key=lambda item: (
+                            item.structural_key.comparison(), item.source_seq
+                        ), default=None,
+                    )
+                    current_key = StructuralKey(
+                        int({value: rank for rank, value in enumerate(FormationStage)}[
+                            FormationStage.APPLIED
+                        ]), False, False, False, 99, 0,
+                    )
+                    if active_epoch is not None and active_epoch.epoch_high_watermark_key is not None:
+                        raw = tuple(active_epoch.epoch_high_watermark_key)
+                        current_key = StructuralKey(
+                            int(raw[0]), bool(raw[1]), bool(raw[2]), bool(raw[3]),
+                            -int(raw[4]), int(raw[5]),
+                        )
+                    stronger = challenger is not None and materially_stronger(
+                        challenger.structural_key, current_key
+                    )
+                    self._journal(
+                        "formation_candidate_compared", game_id=pending_app.game_id,
+                        challenger_game_id=(challenger.opportunity.game_id if challenger else None),
+                        current_structural_key=list(current_key.comparison()),
+                        challenger_structural_key=(
+                            list(challenger.structural_key.comparison()) if challenger else None
+                        ), decision="SWITCH" if stronger else "STAY",
+                        reason_code="strict_structural_comparator",
+                    )
+                    if stronger and challenger is not None:
+                        selected = next(
+                            item.invite for item in candidates
+                            if item.invite.game_id == challenger.opportunity.game_id
+                            and item.invite.from_did == challenger.opportunity.inviter_did
+                        )
+                    else:
+                        selected = None
             expiry_reason = None
             if pending_app is not None:
-                expiry_reason = application_expiry_reason(
-                    pending_app,
-                    now=now,
-                    active_team=self.state.active_team(),
-                    signed_games=signed_games,
-                    progressed_games=roster_games,
-                    better_candidate_available=selected is not None,
-                    progressed_at=progressed_at,
-                )
+                ready_at_boundary = False
+                if age is not None and age >= 60:
+                    ready_at_boundary = any(
+                        item.roster.game_id == pending_app.game_id
+                        for item in roster_consensus(
+                            discovery_events,
+                            anchor_signer=pending_app.inviter_did,
+                            min_anchor_seq=pending_app.invite_seq,
+                        )
+                    )
+                if age is not None and age >= 20:
+                    epoch_id = active_epoch.epoch_id if active_epoch is not None else pending_app.request_id
+                    soft_key = f"formation_soft_stall:{epoch_id}"
+                    if not self.state.get(soft_key, False):
+                        self.state.set(soft_key, True)
+                        self._journal(
+                            "formation_soft_stall", game_id=pending_app.game_id,
+                            epoch_id=epoch_id, stall_age_seconds=round(age * 60),
+                            reason_code="structural_progress_watchdog",
+                        )
+                    if selected is None:
+                        self._journal(
+                            "formation_stay", game_id=pending_app.game_id,
+                            epoch_id=epoch_id, decision="STAY",
+                            reason_code="no_materially_stronger_challenger",
+                        )
+                if (
+                    active_epoch is not None and age is not None and age >= 60
+                    and not ready_at_boundary
+                ):
+                    now_utc = now.astimezone(timezone.utc)
+                    if active_epoch.replacement_recovery_active(now_utc):
+                        self._journal(
+                            "formation_stay", game_id=active_epoch.game_id,
+                            epoch_id=active_epoch.epoch_id,
+                            decision="REPLACEMENT_RECOVERY",
+                            reason_code="fixed_recovery_grace_active",
+                            replacement_recovery_deadline=active_epoch.replacement_recovery_deadline,
+                        )
+                        return
+                    if (
+                        active_epoch.replacement_recovery_used
+                        and active_epoch.replacement_recovery_deadline is not None
+                    ):
+                        self._journal(
+                            "formation_recovery_grace_expired", game_id=active_epoch.game_id,
+                            epoch_id=active_epoch.epoch_id,
+                            reason_code="fixed_deadline_reached",
+                            replacement_recovery_deadline=active_epoch.replacement_recovery_deadline,
+                        )
+                        active_epoch.replacement_recovery_deadline = None
+                        TeamFormationStore(self.state).save_epoch(active_epoch)
+                    elif (
+                        active_epoch.replacement_of_fingerprint is not None
+                        and not active_epoch.replacement_recovery_used
+                        and active_epoch.lineage_last_progress_at is not None
+                        and now_utc - datetime.fromisoformat(
+                            active_epoch.lineage_last_progress_at
+                        ) <= timedelta(minutes=20)
+                    ):
+                        history = (
+                            TeamFormationStore(self.state).load_history(
+                                ROOMS.discovery, discovery_generation
+                            ) if discovery_generation is not None else None
+                        )
+                        complete = history is None or not history.reconciliation_required
+                        replacement_roster = next((
+                            parsed[0] for _, parsed in parsed_rosters
+                            if roster_fingerprint(parsed[0]) == active_epoch.active_roster_fingerprint
+                        ), None)
+                        joinable = False
+                        if complete and replacement_roster is not None:
+                            owner = self.tc.owner_note(replacement_roster.poem_room)
+                            room_records, room_generation = self.tc.read_page(
+                                replacement_roster.poem_room, 0, 0
+                            )
+                            referee = self.state.get("referee_did")
+                            joinable = isinstance(referee, str) and team_room_is_open(
+                                replacement_roster, referee, owner,
+                                room_generation, room_records,
+                            )
+                        if joinable and active_epoch.maybe_start_replacement_recovery(now_utc):
+                            TeamFormationStore(self.state).save_epoch(active_epoch)
+                            self._journal(
+                                "formation_recovery_grace_started", game_id=active_epoch.game_id,
+                                epoch_id=active_epoch.epoch_id,
+                                reason_code="legitimate_replacement_progress",
+                                replacement_recovery_used=True,
+                                replacement_recovery_deadline=active_epoch.replacement_recovery_deadline,
+                            )
+                            return
+                if active_epoch is not None:
+                    policy_decision = formation_decision(
+                        active_epoch,
+                        history_complete=not history_unresolved,
+                        ready_to_countersign=ready_at_boundary,
+                        challenger_stronger=(
+                            selected is not None and age is not None and 20 <= age < 60
+                        ),
+                        now=now,
+                    )
+                    expiry_reason = {
+                        "SWITCH": "materially_stronger_candidate",
+                        "HARD_STALL": "hard_timeout",
+                        "ABANDON_UNCERTAIN_HISTORY": "hard_timeout",
+                    }.get(policy_decision)
+                else:
+                    expiry_reason = None if ready_at_boundary else (
+                        "materially_stronger_candidate"
+                        if selected is not None and age is not None and 20 <= age < 60
+                        else application_expiry_reason(
+                            pending_app,
+                            now=now,
+                            active_team=self.state.active_team(),
+                            signed_games=signed_games,
+                            progressed_games=roster_games,
+                            better_candidate_available=False,
+                            progressed_at=progressed_at,
+                        )
+                    )
                 if expiry_reason is not None:
+                    epoch = TeamFormationStore(self.state).active_epoch()
+                    if epoch is not None and epoch.application_request_id == pending_app.request_id:
+                        history = (
+                            TeamFormationStore(self.state).load_history(
+                                ROOMS.discovery, discovery_generation
+                            ) if discovery_generation is not None else None
+                        )
+                        uncertain = bool(history and history.reconciliation_required)
+                        epoch.status = (
+                            "abandoned" if expiry_reason == "materially_stronger_candidate"
+                            else "abandoned_uncertain_history" if uncertain
+                            else "hard_stalled"
+                        )
+                        TeamFormationStore(self.state).save_epoch(epoch, active=False)
+                        self._journal(
+                            "formation_switch" if expiry_reason == "materially_stronger_candidate"
+                            else "formation_preconsent_uncertain_abandon" if uncertain
+                            else "formation_hard_stall",
+                            game_id=epoch.game_id,
+                            reason_code=expiry_reason,
+                            decision=("SWITCH" if expiry_reason == "materially_stronger_candidate" else "HARD_STALL"),
+                        )
+                        self._journal(
+                            "formation_epoch_ended", game_id=epoch.game_id,
+                            reason_code=epoch.status,
+                        )
                     self._journal(
                         "team_application_expired",
                         game_id=pending_app.game_id,
@@ -390,8 +1099,30 @@ class Daemon:
                 if not self.live:
                     self.state.set("dry_run_action", payload)
                     return
-                self.state.reserve_request(
-                    payload["request_id"], f"application:{selected.game_id}", payload
+                now = datetime.now(timezone.utc)
+                epoch = start_epoch(
+                    FormationOpportunity(
+                        selected.game_id, selected.from_did, selected.seq, now,
+                        selected.poem_room, selected.room_generation,
+                    ), payload["request_id"], now,
+                )
+                self.state.persist_protocol_intent(
+                    payload["request_id"], "application", ROOMS.discovery, payload,
+                    ApplicationDelivery.POSTED_UNCONFIRMED.value,
+                    game_id=selected.game_id, created_at=now.isoformat(),
+                    reconcile_started_at=epoch.application_reconcile_started_at,
+                    reconcile_deadline=epoch.application_reconcile_deadline,
+                )
+                TeamFormationStore(self.state).save_epoch(epoch)
+                self._journal(
+                    "formation_epoch_started", game_id=selected.game_id,
+                    epoch_id=epoch.epoch_id, request_id=payload["request_id"],
+                    reason_code="application_intent_created",
+                )
+                self.state.reserve_request(payload["request_id"], f"application:{selected.game_id}", payload)
+                self._journal(
+                    "formation_application_posted_unconfirmed", game_id=selected.game_id,
+                    request_id=payload["request_id"], reason_code="send_intent_persisted",
                 )
                 self._post(ROOMS.discovery, payload)
                 self._journal(
@@ -433,7 +1164,41 @@ class Daemon:
         ]
         journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
         pending_game = pending_application(journal_path)
-        expired_games = expired_application_games(journal_path)
+        active_epoch = TeamFormationStore(self.state).active_epoch()
+        if pending_game is not None and active_epoch is None:
+            durable = self.state.db.execute(
+                "SELECT 1 FROM requests WHERE request_id=? AND kind LIKE 'application:%' "
+                "AND status IN ('pending','posted')", (pending_game.request_id,),
+            ).fetchone()
+            if durable is None:
+                pending_game = None
+        if active_epoch is not None and active_epoch.status == "active":
+            observed = (
+                datetime.fromisoformat(active_epoch.application_observed_at)
+                if active_epoch.application_observed_at else None
+            )
+            pending_game = PendingApplication(
+                active_epoch.game_id, active_epoch.application_request_id, observed,
+                invite_seq=active_epoch.starting_invite_seq,
+                inviter_did=active_epoch.inviter_did,
+            )
+        expired_games = {
+            row["game_id"] for row in self.state.db.execute(
+                "SELECT game_id FROM formation_epochs WHERE active=0 "
+                "AND status IN ('hard_stalled','abandoned','abandoned_uncertain_history',"
+                "'abandoned_unconfirmed','invalid')"
+            ).fetchall()
+        }
+        # Backward-compatible journal evidence is supplementary only when a
+        # durable request row independently confirms the terminal lifecycle.
+        for game_id in expired_application_games(journal_path):
+            durable = self.state.db.execute(
+                "SELECT 1 FROM requests WHERE kind=? AND status IN "
+                "('expired','withdrawn','delivery_unknown','rejected') LIMIT 1",
+                (f"application:{game_id}",),
+            ).fetchone()
+            if durable is not None:
+                expired_games.add(game_id)
         anchor_signer = (
             pending_game.inviter_did
             if (
@@ -448,11 +1213,20 @@ class Daemon:
             if anchor_signer is not None and pending_game is not None
             else None
         )
-        for consensus in roster_consensus(
+        consensus_candidates = roster_consensus(
             discovery_events,
             anchor_signer=anchor_signer,
             min_anchor_seq=min_anchor_seq,
-        ):
+        )
+        if pending_game is not None:
+            compatible = [item for item in consensus_candidates if item.roster.game_id == pending_game.game_id]
+            if len(compatible) > 1:
+                self._journal(
+                    "formation_roster_ambiguous", game_id=pending_game.game_id,
+                    variant_count=len(compatible), reason_code="multiple_current_inviter_rosters",
+                )
+                return
+        for consensus in consensus_candidates:
             proposal = consensus.roster
             if pending_game is not None and proposal.game_id != pending_game.game_id:
                 continue
@@ -465,18 +1239,65 @@ class Daemon:
                 continue
             if proposal.game_id in expired_games:
                 continue
+            history = TeamFormationStore(self.state).load_history(
+                ROOMS.discovery, discovery_generation
+            ) if discovery_generation is not None else None
+            relevant_start = min_anchor_seq or 1
+            if history is not None and not history.is_complete(
+                relevant_start, consensus.completed_at_seq
+            ):
+                if self._reconcile_history(
+                    ROOMS.discovery, discovery_generation,
+                    relevant_start, consensus.completed_at_seq,
+                ):
+                    return self._discovery()
+                continue
             owner = self.tc.owner_note(proposal.poem_room)
             records, generation = self.tc.read_page(proposal.poem_room, 0, 0)
             if not team_room_is_open(proposal, referee, owner, generation, records):
                 continue
+            self._journal(
+                "formation_roster_affirmed_by_recruitment", game_id=proposal.game_id,
+                source_seq=consensus.completed_at_seq,
+                roster_fingerprint=roster_fingerprint(proposal),
+                signer_count=len(consensus.signers), member_count=len(proposal.members),
+                missing_signers=len(set(proposal.members) - set(consensus.signers)),
+                reason_code="unique_complete_inviter_anchored_roster",
+            )
+            self._journal(
+                "formation_ready_to_countersign", game_id=proposal.game_id,
+                source_seq=consensus.completed_at_seq,
+                roster_fingerprint=roster_fingerprint(proposal),
+                reason_code="all_other_members_current_consent",
+                decision="COUNTERSIGN",
+            )
             payload = proposal.payload(request_id("roster"))
             self.state.set("roster_candidate", payload)
             if not self.live:
                 self.state.set("dry_run_action", payload)
                 return
-            self.state.reserve_request(payload["request_id"], "roster", payload)
             if not self.state.select_team(proposal.game_id):
                 return
+            fingerprint = roster_fingerprint(proposal)
+            created_at = datetime.now(timezone.utc).isoformat()
+            self.state.persist_protocol_intent(
+                payload["request_id"], "roster", ROOMS.discovery, payload,
+                ConsentDelivery.CONSENT_POSTED_UNCONFIRMED.value,
+                game_id=proposal.game_id, roster_fingerprint=fingerprint,
+                created_at=created_at,
+            )
+            epoch = TeamFormationStore(self.state).active_epoch()
+            if epoch is not None:
+                epoch.consent_delivery_state = ConsentDelivery.CONSENT_POSTED_UNCONFIRMED
+                epoch.consent_request_id = payload["request_id"]
+                epoch.consent_roster_fingerprint = fingerprint
+                TeamFormationStore(self.state).save_epoch(epoch)
+            self._journal(
+                "formation_consent_intent_persisted", game_id=proposal.game_id,
+                request_id=payload["request_id"], roster_fingerprint=fingerprint,
+                reason_code="write_ahead_committed",
+            )
+            self.state.reserve_request(payload["request_id"], "roster", payload)
             self.state.set("team_setup", {
                 "game_id": proposal.game_id,
                 "poem_room": proposal.poem_room,
@@ -502,6 +1323,7 @@ class Daemon:
         self.state.set("roster_wait_soft_timeout_noted", False)
 
     def _wait_roster_ready(self) -> None:
+        self._bootstrap_formation_state()
         # Referee resolution wins every race. Process receipts first.
         self._receipts(ROOMS.discovery)
         if self.state.phase != Phase.WAIT_ROSTER_READY:
@@ -548,6 +1370,93 @@ class Daemon:
             for event in self.state.events(ROOMS.discovery)
             if event.get("_room_generation") == discovery_generation
         ]
+        withdraw_intent = self.state.unresolved_protocol_intent("withdraw")
+        if withdraw_intent is not None and withdraw_intent.get("game_id") == game_id:
+            reconciled = False
+            for raw in discovery_events:
+                parsed_withdrawal = signed_withdrawal(raw)
+                if parsed_withdrawal != (game_id, SARUKU_DID):
+                    continue
+                try:
+                    exact = json.loads(raw["text"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                if exact.get("request_id") == withdraw_intent["request_id"]:
+                    reconciled = True
+                    break
+            if not reconciled:
+                return
+            self.state.set_protocol_delivery(withdraw_intent["request_id"], "CONFIRMED")
+            self.state.set_request_status(withdraw_intent["request_id"], "accepted")
+            roster_request_id = pending.get("request_id")
+            if isinstance(roster_request_id, str):
+                self.state.set_request_status(roster_request_id, "withdrawn")
+            epoch = TeamFormationStore(self.state).active_epoch()
+            if epoch is not None:
+                epoch.withdraw_pending = False
+                epoch.status = "abandoned"
+                TeamFormationStore(self.state).save_epoch(epoch, active=False)
+            self._journal(
+                "formation_withdraw_reconciled", game_id=game_id,
+                request_id=withdraw_intent["request_id"],
+                reason_code="exact_discovery_readback",
+            )
+            self.state.set("active_team", None)
+            self.state.set("team_setup", None)
+            self.state.set("roster_candidate", None)
+            self.state.set("roster_consent_accepted", False)
+            self._clear_roster_wait_state()
+            self.state.set("last_error", None)
+            self.state.phase = Phase.DISCOVERY
+            return
+        intent = self.state.protocol_intent(str(pending.get("request_id", "")))
+        if intent is not None and intent.get("delivery_state") in {
+            ConsentDelivery.CONSENT_POSTED_UNCONFIRMED,
+            ConsentDelivery.CONSENT_DELIVERY_UNKNOWN,
+        }:
+            confirmed = False
+            for raw in discovery_events:
+                parsed = signed_roster(raw)
+                if parsed != (target, SARUKU_DID):
+                    continue
+                try:
+                    exact = json.loads(raw["text"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                if exact.get("request_id") == pending.get("request_id"):
+                    confirmed = True
+                    break
+            if confirmed:
+                self.state.set_protocol_delivery(
+                    pending["request_id"], ConsentDelivery.CONSENT_CONFIRMED
+                )
+                epoch = TeamFormationStore(self.state).active_epoch()
+                if epoch is not None:
+                    epoch.consent_delivery_state = ConsentDelivery.CONSENT_CONFIRMED
+                    epoch.formation_stage = FormationStage.WAIT_ROSTER_READY
+                    TeamFormationStore(self.state).save_epoch(epoch)
+                self._journal(
+                    "formation_consent_confirmed", game_id=game_id,
+                    request_id=pending["request_id"],
+                    reason_code="exact_discovery_readback",
+                )
+            else:
+                # Official consent uncertainty has no bounded local escape.
+                if intent.get("delivery_state") == ConsentDelivery.CONSENT_POSTED_UNCONFIRMED:
+                    self.state.set_protocol_delivery(
+                        pending["request_id"], ConsentDelivery.CONSENT_DELIVERY_UNKNOWN
+                    )
+                    epoch = TeamFormationStore(self.state).active_epoch()
+                    if epoch is not None:
+                        epoch.consent_delivery_state = ConsentDelivery.CONSENT_DELIVERY_UNKNOWN
+                        epoch.formation_stage = FormationStage.CONSENT_RECONCILING
+                        TeamFormationStore(self.state).save_epoch(epoch)
+                    self._journal(
+                        "formation_consent_delivery_unknown", game_id=game_id,
+                        request_id=pending["request_id"],
+                        reason_code="no_authoritative_resolution",
+                    )
+                return
         observed = set(current_roster_signers(discovery_events, target))
         # Our POST may be absent from the local read after an ambiguous
         # transport outcome. Treat our consent as potentially live.
@@ -614,6 +1523,24 @@ class Daemon:
         if age_minutes < 60:
             return
 
+        history = (
+            TeamFormationStore(self.state).load_history(
+                ROOMS.discovery, discovery_generation
+            ) if discovery_generation is not None else None
+        )
+        if history is not None:
+            start_seq = 1
+            epoch = TeamFormationStore(self.state).active_epoch()
+            if epoch is not None:
+                start_seq = epoch.consent_source_seq or epoch.application_source_seq or 1
+            end_seq = history.highest_observed_seq
+            if not history.is_complete(start_seq, end_seq):
+                if self._reconcile_history(
+                    ROOMS.discovery, discovery_generation, start_seq, end_seq
+                ):
+                    return self._wait_roster_ready()
+                return
+
         # Fail closed on any hint that the roster may already be frozen.
         referee = self.state.get("referee_did")
         if not isinstance(referee, str):
@@ -622,13 +1549,31 @@ class Daemon:
         room_records, actual_generation = self.tc.read_page(
             poem_room, 0, 0
         )
-        if not team_room_is_open(
+        withdrawal_legal = team_room_is_open(
             target,
             referee,
             owner,
             actual_generation,
             room_records,
-        ):
+        )
+        epoch = TeamFormationStore(self.state).active_epoch()
+        if epoch is not None:
+            epoch.epoch_high_watermark_at = progress_at.astimezone(timezone.utc).isoformat()
+            if epoch.consent_delivery_state == ConsentDelivery.NOT_SENT:
+                epoch.consent_delivery_state = ConsentDelivery.CONSENT_CONFIRMED
+            TeamFormationStore(self.state).save_epoch(epoch)
+            decision = formation_decision(
+                epoch, history_complete=True, wait_roster_ready=True,
+                withdrawal_legal=withdrawal_legal, now=now,
+            )
+            if decision != "SAFE_WITHDRAW":
+                self.state.set(
+                    "last_error",
+                    "team room may be frozen/closed; refusing automatic withdrawal; "
+                    "reconciling fail-closed",
+                )
+                return
+        elif not withdrawal_legal:
             self.state.set(
                 "last_error",
                 "team room may be frozen/closed; refusing automatic withdrawal",
@@ -642,6 +1587,21 @@ class Daemon:
             return
 
         if withdraw_pending is None:
+            created_at = datetime.now(timezone.utc).isoformat()
+            self.state.persist_protocol_intent(
+                withdraw_payload["request_id"], "withdraw", ROOMS.discovery,
+                withdraw_payload, "POSTED_UNCONFIRMED", game_id=game_id,
+                created_at=created_at,
+            )
+            epoch = TeamFormationStore(self.state).active_epoch()
+            if epoch is not None:
+                epoch.withdraw_pending = True
+                epoch.withdraw_request_id = withdraw_payload["request_id"]
+                TeamFormationStore(self.state).save_epoch(epoch)
+            self._journal(
+                "formation_withdraw_intent_persisted", game_id=game_id,
+                request_id=withdraw_payload["request_id"], reason_code="write_ahead_committed",
+            )
             self.state.reserve_request(
                 withdraw_payload["request_id"],
                 "withdraw",
@@ -653,25 +1613,13 @@ class Daemon:
             withdraw_payload["request_id"],
             "posted",
         )
-        roster_request_id = pending.get("request_id")
-        if isinstance(roster_request_id, str):
-            self.state.set_request_status(
-                roster_request_id,
-                "withdrawn",
-            )
         self._journal(
-            "roster_wait_withdrawn",
+            "formation_withdraw_posted_unconfirmed",
             game_id=game_id,
             request_id=withdraw_payload["request_id"],
             minutes_since_progress=round(age_minutes, 2),
+            reason_code="awaiting_authoritative_readback",
         )
-        self.state.set("active_team", None)
-        self.state.set("team_setup", None)
-        self.state.set("roster_candidate", None)
-        self.state.set("roster_consent_accepted", False)
-        self._clear_roster_wait_state()
-        self.state.set("last_error", None)
-        self.state.phase = Phase.DISCOVERY
 
     def _ensure_team_intro(self, poem_room: str, game_id: str) -> bool:
         kind = f"team_capability_announcement:{game_id}"

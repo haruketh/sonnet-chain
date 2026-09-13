@@ -163,6 +163,10 @@ def daemon_fixture(tmp_path: Path, referee: str) -> Daemon:
 def pending_roster(daemon: Daemon, members: list[str], request_id: str = "roster-own") -> dict:
     payload = roster_payload("ours", members, request_id)
     daemon.state.reserve_request(request_id, "roster", payload)
+    daemon.state.persist_protocol_intent(
+        request_id, "roster", ROOMS.discovery, payload, "CONSENT_CONFIRMED",
+        game_id="ours", created_at="2026-01-01T00:00:00+00:00",
+    )
     daemon.state.set("active_team", "ours")
     daemon.state.phase = Phase.WAIT_ROSTER_READY
     return payload
@@ -188,6 +192,27 @@ def test_own_generic_roster_receipt_false_does_not_enter_writing(tmp_path: Path)
         daemon._receipts(ROOMS.discovery)
         assert daemon.state.phase == Phase.WAIT_ROSTER_READY
         assert daemon.state.get("roster_consent_accepted") is True
+    finally:
+        daemon.state.close()
+
+
+def test_trusted_roster_rejection_resolves_consent_uncertainty(tmp_path: Path):
+    referee_key = Ed25519PrivateKey.generate()
+    daemon = daemon_fixture(tmp_path, did_of(referee_key))
+    _, members = roster_fixture()
+    payload = pending_roster(daemon, members)
+    daemon.state.set_protocol_delivery(payload["request_id"], "CONSENT_DELIVERY_UNKNOWN")
+    raw = signed(referee_key, ROOMS.discovery, {
+        "type": "sonnet.receipt.v1", "contest_id": CONTEST_ID,
+        "request_id": payload["request_id"], "sender_did": SARUKU_DID,
+        "status": "rejected", "roster_ready": False, "state_hash": "rejected-state",
+    }, 9)
+    daemon.state.record_event(ROOMS.discovery, 9, 1, raw)
+    try:
+        daemon._receipts(ROOMS.discovery)
+        intent = daemon.state.protocol_intent(payload["request_id"])
+        assert intent["delivery_state"] == "CONSENT_EXPLICITLY_NOT_PERSISTED"
+        assert daemon.state.phase == Phase.DISCOVERY
     finally:
         daemon.state.close()
 
@@ -456,7 +481,7 @@ def test_b1_fully_signed_roster_never_auto_withdraws(tmp_path: Path):
         daemon.state.close()
 
 
-def test_b1_stale_incomplete_roster_auto_withdraws(tmp_path: Path):
+def test_b1_stale_incomplete_roster_waits_for_withdraw_readback(tmp_path: Path):
     referee = did_of(Ed25519PrivateKey.generate())
     daemon = daemon_fixture(tmp_path, referee)
     keys, members = roster_fixture()
@@ -488,9 +513,10 @@ def test_b1_stale_incomplete_roster_auto_withdraws(tmp_path: Path):
         assert len(posted) == 1
         assert posted[0]["type"] == "sonnet.withdraw.v1"
         assert posted[0]["game_id"] == "ours"
-        assert daemon.state.pending_request("roster") is None
-        assert daemon.state.active_team() is None
-        assert daemon.state.phase == Phase.DISCOVERY
+        assert daemon.state.pending_request("roster") is not None
+        assert daemon.state.active_team() == "ours"
+        assert daemon.state.phase == Phase.WAIT_ROSTER_READY
+        assert daemon.state.unresolved_protocol_intent("withdraw") is not None
     finally:
         daemon.state.close()
 
@@ -549,24 +575,20 @@ def test_b1_frozen_team_room_refuses_auto_withdraw(tmp_path: Path):
 
 
 
-def test_b2_inviter_signature_is_enough_for_anchored_consensus():
+def test_v02_anchored_consensus_requires_all_other_signers():
     keys, members = roster_fixture()
     inviter = did_of(keys[0])
-    record = signed(
-        keys[0],
-        ROOMS.discovery,
-        roster_payload("anchored", members, "r-1"),
-        1,
-    )
+    records = [signed(key, ROOMS.discovery, roster_payload("anchored", members, f"r-{seq}"), seq)
+               for seq, key in enumerate(keys, 1)]
 
     result = roster_consensus(
-        [record],
+        records,
         anchor_signer=inviter,
     )
 
     assert len(result) == 1
     assert result[0].roster.members == tuple(members)
-    assert result[0].signers == frozenset({inviter})
+    assert result[0].signers == frozenset(members[:-1])
 
 
 def test_b2_non_inviter_signature_is_not_enough_for_anchored_consensus():
@@ -614,7 +636,7 @@ def test_b2_inviter_withdrawal_removes_anchor_readiness():
     ) == []
 
 
-def test_b2_daemon_countersigns_when_inviter_signs_exact_roster(
+def test_b2_daemon_countersigns_when_all_peers_sign_exact_roster(
     tmp_path: Path,
 ):
     referee = did_of(Ed25519PrivateKey.generate())
@@ -640,14 +662,10 @@ def test_b2_daemon_countersigns_when_inviter_signs_exact_roster(
         invite_seq=1,
     )
 
-    # The inviter signs after the invite/application epoch began.
-    raw = signed(
-        keys[0],
-        ROOMS.discovery,
-        roster_payload("anchored", members, "r-inviter"),
-        2,
-    )
-    daemon.state.record_event(ROOMS.discovery, 2, 1, raw)
+    # All peers, including the inviter, sign after the application epoch began.
+    for seq, key in enumerate(keys, 2):
+        raw = signed(key, ROOMS.discovery, roster_payload("anchored", members, f"r-{seq}"), seq)
+        daemon.state.record_event(ROOMS.discovery, seq, 1, raw)
 
     class TeamRoom:
         def owner_note(self, room):
@@ -702,6 +720,7 @@ def test_b2_anchor_signature_must_be_after_invite_epoch():
             12,
         )
     )
+    records.append(signed(keys[2], ROOMS.discovery, roster_payload("epoch", members, "r-third"), 13))
     result = roster_consensus(
         records,
         anchor_signer=inviter,

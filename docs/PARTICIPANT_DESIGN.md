@@ -1,5 +1,9 @@
 # Sonnet Chain Participant Design v0.1
 
+> STEP1 Team Formation is normatively defined by
+> `docs/STEP1 Team Formation Design v0.2.md`. That frozen design takes
+> precedence over this historical architecture context on any conflict.
+
 ## 1. Goal
 
 Run Saruku as an independent participant in FLOP Labs' official `sonnet-2` contest while preserving the official rules, signatures and referee authority.

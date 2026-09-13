@@ -12,8 +12,13 @@ from sonnet_chain.daemon import Daemon
 from sonnet_chain.invites import application_should_expire, direct_invite, pending_application
 from sonnet_chain.journal import Journal
 from sonnet_chain.protocol import team_application
+from sonnet_chain.rosters import CanonicalRoster
 from sonnet_chain.signing import Signer, did_of
 from sonnet_chain.state import Phase, StateStore
+from sonnet_chain.team_formation import (
+    ApplicationDelivery, FormationOpportunity, StructuralKey, TeamFormationStore,
+    roster_fingerprint, start_epoch,
+)
 
 
 def _signed(key: Ed25519PrivateKey, payload: dict, seq: int = 1) -> dict:
@@ -68,6 +73,12 @@ def _daemon(tmp_path: Path) -> Daemon:
     daemon.state.phase = Phase.DISCOVERY
     daemon.journal = Journal(tmp_path / "journal" / "sonnet.jsonl")
     daemon._read = lambda room: []
+    # Legacy flow fixtures treat their generated senders as referee-accepted
+    # writers; v0.2 production code obtains this set from registration facts.
+    daemon._trusted_writer_dids = lambda: {
+        item.get("from") for item in daemon.state.events(ROOMS.discovery)
+        if isinstance(item.get("from"), str)
+    }
     return daemon
 
 
@@ -92,6 +103,22 @@ def _record_application(
         json.dumps(record) + "\n",
         encoding="utf-8",
     )
+    payload = team_application(
+        game_id, "https://x.com/sarukubt", f"application-{game_id}"
+    )
+    daemon.state.reserve_request(
+        f"application-{game_id}", f"application:{game_id}", payload
+    )
+    sent_at = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    epoch = start_epoch(
+        FormationOpportunity(
+            game_id, "did:key:zLead", invite_seq or 0, sent_at
+        ), f"application-{game_id}", sent_at,
+    )
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = sent_at.isoformat()
+    epoch.starting_invite_seq = invite_seq
+    TeamFormationStore(daemon.state).save_epoch(epoch)
 
 
 def _ready_roster(
@@ -157,15 +184,20 @@ def _team_room(daemon: Daemon):
     return TeamRoom()
 
 
-@pytest.mark.parametrize("kind", ["sonnet.note.v1", "sonnet.invite.v1", "sonnet.invite.v2"])
-def test_detects_signed_direct_invite_for_saruku(kind: str) -> None:
+def test_detects_signed_direct_invite_for_saruku() -> None:
     key = Ed25519PrivateKey.generate()
 
-    invite = direct_invite(_invite(key, kind=kind))
+    invite = direct_invite(_invite(key), trusted_writer_dids={did_of(key)})
 
     assert invite is not None
     assert invite.game_id == "deftink"
     assert invite.from_did == did_of(key)
+
+
+@pytest.mark.parametrize("kind", ["sonnet.invite.v1", "sonnet.invite.v2"])
+def test_vote_or_undefined_invite_is_ignored_for_team_formation(kind: str) -> None:
+    key = Ed25519PrivateKey.generate()
+    assert direct_invite(_invite(key, kind=kind), trusted_writer_dids={did_of(key)}) is None
 
 
 def test_invite_for_another_did_is_ignored() -> None:
@@ -199,7 +231,7 @@ def test_active_team_prevents_application(tmp_path: Path) -> None:
         daemon.state.close()
 
 
-def test_prior_journal_application_prevents_duplicate(tmp_path: Path) -> None:
+def test_prior_journal_application_without_durable_evidence_does_not_block(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
     daemon.journal.append(
         "team_application_sent", game_id="deftink", target_from_did="did:key:zLead",
@@ -213,7 +245,8 @@ def test_prior_journal_application_prevents_duplicate(tmp_path: Path) -> None:
     daemon.live = True
     try:
         daemon._discovery()
-        assert posted == []
+        assert len(posted) == 1
+        assert posted[0]["game_id"] == "deftink"
     finally:
         daemon.state.close()
 
@@ -315,7 +348,7 @@ def test_verified_room_outranks_newer_unverified_invite(tmp_path: Path) -> None:
         daemon.state.close()
 
 
-def test_pending_application_blocks_another_game(tmp_path: Path) -> None:
+def test_journal_only_application_is_not_safety_authority(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
     daemon.journal.append(
         "team_application_sent", game_id="hayes", target_from_did="did:key:zLead",
@@ -330,7 +363,8 @@ def test_pending_application_blocks_another_game(tmp_path: Path) -> None:
     daemon.live = True
     try:
         daemon._discovery()
-        assert posted == []
+        assert len(posted) == 1
+        assert posted[0]["game_id"] == "deftink"
         assert daemon.state.phase == Phase.DISCOVERY
         assert daemon.state.active_team() is None
     finally:
@@ -374,7 +408,7 @@ def test_stale_application_expires_once(tmp_path: Path) -> None:
         daemon.state.close()
 
 
-def test_soft_timeout_moves_to_one_better_candidate(tmp_path: Path) -> None:
+def test_soft_timeout_does_not_switch_merely_for_new_candidate(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
     _record_application(daemon, "hayes", 21)
     daemon.state.record_event(
@@ -387,13 +421,218 @@ def test_soft_timeout_moves_to_one_better_candidate(tmp_path: Path) -> None:
     try:
         daemon._discovery()
         daemon._discovery()
-        assert len(posted) == 1
-        assert posted[0]["type"] == "sonnet.application.v1"
-        assert posted[0]["game_id"] == "deftink"
+        assert posted == []
         records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
         expiries = [record for record in records if record["event"] == "team_application_expired"]
-        assert len(expiries) == 1
-        assert expiries[0]["reason"] == "better_candidate_available"
+        assert expiries == []
+        assert pending_application(daemon.journal.path).game_id == "hayes"
+    finally:
+        daemon.state.close()
+
+
+def test_soft_stall_switches_to_cross_game_structurally_stronger_roster(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    now = datetime.now(timezone.utc)
+    current_inviter = Ed25519PrivateKey.generate()
+    epoch = start_epoch(
+        FormationOpportunity("current", did_of(current_inviter), 1, now),
+        "application-current", now - timedelta(minutes=21),
+    )
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = (now - timedelta(minutes=21)).isoformat()
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+
+    lead = Ed25519PrivateKey.generate()
+    other = Ed25519PrivateKey.generate()
+    fourth = Ed25519PrivateKey.generate()
+    members = [did_of(lead), did_of(other), did_of(fourth), SARUKU_DID]
+    daemon.state.record_event(ROOMS.discovery, 1, 1, _invite(lead, game_id="better", seq=1))
+    proposal = {
+        "type": "sonnet.roster.v1", "contest_id": CONTEST_ID,
+        "game_id": "better", "poem_room": ROOMS.team("better"),
+        "room_generation": 3, "members": members, "request_id": "better-r",
+    }
+    daemon.state.record_event(ROOMS.discovery, 2, 1, _signed(lead, proposal, 2))
+    daemon.state.record_event(ROOMS.discovery, 3, 1, _signed(other, proposal, 3))
+    daemon.tc = _team_room(daemon)
+    posted = []; daemon._post = lambda room, payload: posted.append(payload); daemon.live = True
+    try:
+        daemon._discovery()
+        assert len(posted) == 1
+        assert posted[0]["type"] == "sonnet.application.v1"
+        assert posted[0]["game_id"] == "better"
+    finally:
+        daemon.state.close()
+
+
+def test_soft_stall_current_three_of_four_beats_fresh_note(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    now = datetime.now(timezone.utc)
+    keys = [Ed25519PrivateKey.generate() for _ in range(3)]
+    members = [did_of(key) for key in keys] + [SARUKU_DID]
+    epoch = start_epoch(
+        FormationOpportunity("current", did_of(keys[0]), 1, now),
+        "application-current", now - timedelta(minutes=21),
+    )
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = (now - timedelta(minutes=21)).isoformat()
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+    proposal = {
+        "type": "sonnet.roster.v1", "contest_id": CONTEST_ID,
+        "game_id": "current", "poem_room": ROOMS.team("current"),
+        "room_generation": 3, "members": members, "request_id": "current-r",
+    }
+    for seq, key in enumerate(keys, 2):
+        daemon.state.record_event(ROOMS.discovery, seq, 1, _signed(key, proposal, seq))
+    challenger = Ed25519PrivateKey.generate()
+    daemon.state.record_event(ROOMS.discovery, 9, 1, _invite(challenger, game_id="fresh", seq=9))
+    daemon.tc = _team_room(daemon)
+    posted = []; daemon._post = lambda room, payload: posted.append(payload); daemon.live = True
+    try:
+        daemon._discovery()
+        assert len(posted) == 1
+        assert posted[0]["type"] == "sonnet.roster.v1"
+        assert posted[0]["game_id"] == "current"
+        assert TeamFormationStore(daemon.state).active_epoch().game_id == "current"
+    finally:
+        daemon.state.close()
+
+
+def test_daemon_starts_one_fixed_replacement_grace(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path); now = datetime.now(timezone.utc)
+    keys = [Ed25519PrivateKey.generate() for _ in range(3)]
+    members = [did_of(key) for key in keys] + [SARUKU_DID]
+    old = CanonicalRoster("current", ROOMS.team("current"), 3, tuple(members))
+    epoch = start_epoch(FormationOpportunity("current", did_of(keys[0]), 1, now),
+                        "application-current", now - timedelta(minutes=61))
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = (now - timedelta(minutes=61)).isoformat()
+    epoch.active_roster_fingerprint = roster_fingerprint(old)
+    epoch.epoch_high_watermark_key = StructuralKey(4, True, True, True, 1, 3).comparison()
+    epoch.epoch_high_watermark_at = (now - timedelta(minutes=61)).isoformat()
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+    replacement_members = [did_of(key) for key in keys[::-1]] + [SARUKU_DID]
+    proposal = {"type": "sonnet.roster.v1", "contest_id": CONTEST_ID,
+                "game_id": "current", "poem_room": ROOMS.team("current"),
+                "room_generation": 3, "members": replacement_members, "request_id": "replacement"}
+    record = _signed(keys[0], proposal, 10)
+    record["created_at"] = now.isoformat()
+    daemon.state.record_event(ROOMS.discovery, 10, 1, record)
+    daemon.tc = _team_room(daemon); daemon.live = True; daemon._post = lambda room, payload: None
+    try:
+        daemon._discovery()
+        recovered = TeamFormationStore(daemon.state).active_epoch()
+        assert recovered.replacement_recovery_used
+        deadline = recovered.replacement_recovery_deadline
+        daemon._discovery()
+        assert TeamFormationStore(daemon.state).active_epoch().replacement_recovery_deadline == deadline
+    finally:
+        daemon.state.close()
+
+
+def test_daemon_fixed_replacement_grace_expiry_hard_stalls(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path); now = datetime.now(timezone.utc)
+    inviter = Ed25519PrivateKey.generate()
+    epoch = start_epoch(FormationOpportunity("current", did_of(inviter), 1, now),
+                        "application-current", now - timedelta(minutes=90))
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = (now - timedelta(minutes=90)).isoformat()
+    epoch.epoch_high_watermark_at = (now - timedelta(minutes=90)).isoformat()
+    epoch.replacement_recovery_used = True
+    epoch.replacement_recovery_deadline = (now - timedelta(seconds=1)).isoformat()
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+    daemon.tc = _team_room(daemon); daemon.live = True; daemon._post = lambda room, payload: None
+    try:
+        daemon._discovery()
+        assert TeamFormationStore(daemon.state).active_epoch() is None
+    finally:
+        daemon.state.close()
+
+
+def test_trusted_referee_rejection_resolves_application_uncertainty(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path); now = datetime.now(timezone.utc)
+    referee_key = Ed25519PrivateKey.generate()
+    daemon.state.set("referee_did", did_of(referee_key))
+    inviter = Ed25519PrivateKey.generate()
+    payload = team_application("current", "https://x.com/sarukubt", "application-current")
+    daemon.state.reserve_request("application-current", "application:current", payload)
+    daemon.state.persist_protocol_intent(
+        "application-current", "application", ROOMS.discovery, payload,
+        "POSTED_UNCONFIRMED", game_id="current", created_at=now.isoformat(),
+    )
+    epoch = start_epoch(FormationOpportunity("current", did_of(inviter), 1, now),
+                        "application-current", now)
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+    rejection = _signed(referee_key, {
+        "type": "sonnet.receipt.v1", "contest_id": CONTEST_ID,
+        "request_id": "application-current", "sender_did": SARUKU_DID,
+        "action_type": "sonnet.application.v1", "status": "rejected",
+    }, 5)
+    daemon.state.record_event(ROOMS.discovery, 5, 1, rejection)
+    try:
+        daemon._receipts(ROOMS.discovery)
+        assert daemon.state.protocol_intent("application-current")["delivery_state"] == "EXPLICITLY_NOT_PERSISTED"
+        assert TeamFormationStore(daemon.state).active_epoch() is None
+    finally:
+        daemon.state.close()
+
+
+def test_unreconciled_history_hard_stall_abandons_only_local_application(tmp_path: Path) -> None:
+    from sonnet_chain.team_formation import FormationHistoryState
+
+    daemon = _daemon(tmp_path); now = datetime.now(timezone.utc)
+    inviter = Ed25519PrivateKey.generate()
+    epoch = start_epoch(FormationOpportunity("current", did_of(inviter), 1, now),
+                        "application-current", now - timedelta(minutes=61))
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = (now - timedelta(minutes=61)).isoformat()
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+    daemon.state.record_event(ROOMS.discovery, 1, 1, {"seq": 1, "text": "unknown"})
+    daemon.state.record_event(ROOMS.discovery, 3, 1, {"seq": 3, "text": "unknown"})
+    history = FormationHistoryState(ROOMS.discovery, 1); history.observe([1, 3])
+    TeamFormationStore(daemon.state).save_history(history)
+    daemon.tc = type("TC", (), {
+        "export_history": lambda self, room: (_ for _ in ()).throw(RuntimeError("unavailable")),
+    })()
+    daemon.live = True; posted = []; daemon._post = lambda room, payload: posted.append(payload)
+    try:
+        daemon._discovery()
+        assert posted == []
+        assert TeamFormationStore(daemon.state).active_epoch() is None
+        events = [json.loads(line)["event"] for line in daemon.journal.path.read_text().splitlines()]
+        assert "formation_preconsent_uncertain_abandon" in events
+    finally:
+        daemon.state.close()
+
+
+def test_possible_consent_blocks_apply_switch_expiry_and_second_countersign(tmp_path: Path) -> None:
+    from sonnet_chain.team_formation import ConsentDelivery
+
+    daemon = _daemon(tmp_path); now = datetime.now(timezone.utc)
+    inviter = Ed25519PrivateKey.generate()
+    epoch = start_epoch(FormationOpportunity("current", did_of(inviter), 1, now),
+                        "application-current", now - timedelta(hours=2))
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = (now - timedelta(hours=2)).isoformat()
+    epoch.consent_delivery_state = ConsentDelivery.CONSENT_DELIVERY_UNKNOWN
+    epoch.consent_request_id = "roster-current"
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+    payload = {"type": "sonnet.roster.v1", "contest_id": CONTEST_ID,
+               "game_id": "current", "poem_room": ROOMS.team("current"),
+               "room_generation": 3, "members": [SARUKU_DID, "did:key:zA", "did:key:zB", "did:key:zC"],
+               "request_id": "roster-current"}
+    daemon.state.persist_protocol_intent(
+        "roster-current", "roster", ROOMS.discovery, payload,
+        "CONSENT_DELIVERY_UNKNOWN", game_id="current", created_at=now.isoformat(),
+    )
+    daemon.state.record_event(ROOMS.discovery, 5, 1,
+                              _invite(Ed25519PrivateKey.generate(), game_id="other", seq=5))
+    posted = []; daemon._post = lambda room, body: posted.append(body); daemon.live = True
+    try:
+        daemon._discovery()
+        assert posted == []
+        assert TeamFormationStore(daemon.state).active_epoch().game_id == "current"
+        assert daemon.state.phase == Phase.DISCOVERY
     finally:
         daemon.state.close()
 
@@ -504,21 +743,30 @@ def test_step1a1_old_progress_eventually_hard_expires(tmp_path: Path) -> None:
 
 
 
-def test_step1a2_fresh_reinvite_same_game_is_allowed(tmp_path: Path) -> None:
+def test_unconfirmed_application_is_not_replaced_from_journal_age(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
-    _record_application(daemon, "hayes", 61, invite_seq=10)
+    daemon.journal.append(
+        "team_application_sent", game_id="hayes", target_from_did="did:key:zLead",
+        request_id="application-hayes", invite_seq=10,
+    )
     daemon.state.reserve_request(
         "application-hayes",
         "application:hayes",
         team_application("hayes", "https://x.com/sarukubt", "application-hayes"),
     )
+    now = datetime.now(timezone.utc)
+    pending_epoch = start_epoch(
+        FormationOpportunity("hayes", "did:key:zLead", 10, now),
+        "application-hayes", now,
+    )
+    TeamFormationStore(daemon.state).save_epoch(pending_epoch)
     daemon.live = True
     posted = []
     daemon._post = lambda room, payload: posted.append(payload)
     try:
         daemon._discovery()
         assert posted == []
-        assert daemon.state.pending_request("application:hayes") is None
+        assert daemon.state.pending_request("application:hayes") is not None
 
         daemon.state.record_event(
             ROOMS.discovery,
@@ -533,17 +781,14 @@ def test_step1a2_fresh_reinvite_same_game_is_allowed(tmp_path: Path) -> None:
         )
         daemon._discovery()
 
-        assert len(posted) == 1
-        assert posted[0]["type"] == "sonnet.application.v1"
-        assert posted[0]["game_id"] == "hayes"
+        assert posted == []
 
         records = [json.loads(line) for line in daemon.journal.path.read_text().splitlines()]
         sent = [
             record for record in records
             if record["event"] == "team_application_sent" and record["game_id"] == "hayes"
         ]
-        assert len(sent) == 2
-        assert sent[-1]["invite_seq"] == 20
+        assert len(sent) == 1
     finally:
         daemon.state.close()
 
@@ -614,7 +859,7 @@ def test_step1a2_old_roster_is_not_revived_by_reinvite(tmp_path: Path) -> None:
         daemon.state.close()
 
 
-def test_step1a2_new_roster_after_reinvite_can_be_signed(tmp_path: Path) -> None:
+def test_new_roster_waits_until_application_delivery_is_reconciled(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
     _record_application(daemon, "hayes", 61, invite_seq=4)
     daemon.live = True
@@ -645,10 +890,10 @@ def test_step1a2_new_roster_after_reinvite_can_be_signed(tmp_path: Path) -> None
         daemon.tc = _team_room(daemon)
         daemon._discovery()
 
-        assert len(posted) == 1
-        assert posted[0]["type"] == "sonnet.roster.v1"
-        assert posted[0]["game_id"] == "hayes"
-        assert daemon.state.phase == Phase.WAIT_ROSTER_READY
+        assert posted == []
+        epoch = TeamFormationStore(daemon.state).active_epoch()
+        assert epoch.application_delivery_state == "POSTED_UNCONFIRMED"
+        assert daemon.state.phase == Phase.DISCOVERY
     finally:
         daemon.state.close()
 
@@ -665,25 +910,27 @@ def test_b1_withdrawn_roster_epoch_requires_fresh_invite(tmp_path: Path) -> None
         request_id="withdraw-1",
         minutes_since_progress=61.0,
     )
+    old_key = Ed25519PrivateKey.generate()
     old_invite = direct_invite(
         _invite(
-            Ed25519PrivateKey.generate(),
+            old_key,
             game_id="hayes",
             seq=10,
             created_at=(
                 datetime.now(timezone.utc) - timedelta(minutes=80)
             ).isoformat().replace("+00:00", "Z"),
-        )
+        ), trusted_writer_dids={did_of(old_key)}
     )
+    fresh_key = Ed25519PrivateKey.generate()
     fresh_invite = direct_invite(
         _invite(
-            Ed25519PrivateKey.generate(),
+            fresh_key,
             game_id="hayes",
             seq=20,
             created_at=datetime.now(timezone.utc)
             .isoformat()
             .replace("+00:00", "Z"),
-        )
+        ), trusted_writer_dids={did_of(fresh_key)}
     )
     try:
         assert old_invite is not None
