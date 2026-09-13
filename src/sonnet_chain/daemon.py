@@ -33,7 +33,7 @@ from .official import sha256, verify_package
 from .poetry import PoemState, build_word_index
 from .protocol import discovery_advertisement, register_writer, request_id, submit, team_application, withdraw, word
 from .publisher import CommandPublisher, PublisherAuthRequired, PublisherUnavailable, canonical_poem
-from .receipts import normalize_llm_receipt, receipt_candidate, receipt_matches
+from .receipts import NormalizedReceipt, normalize_llm_receipt, receipt_candidate, receipt_matches
 from .rosters import (
     CanonicalRoster, current_roster_signers, roster_consensus, signed_roster,
     signed_withdrawal, team_room_is_open,
@@ -189,18 +189,7 @@ class Daemon:
         return contest
 
     def _trusted_writer_dids(self) -> set[str]:
-        referee = self.state.get("referee_did")
-        if not isinstance(referee, str):
-            return set()
-        writers = self.state.trusted_writer_dids()
-        for raw in self.state.events(ROOMS.registration):
-            receipt = receipt_candidate(ROOMS.registration, raw, referee)
-            if receipt is None or receipt.kind != "registration_accepted":
-                continue
-            did = receipt.payload.get("participant_did", receipt.payload.get("sender_did"))
-            if receipt.payload.get("role") == "writer" and isinstance(did, str):
-                writers.add(did)
-        return writers
+        return self.state.trusted_writer_dids()
 
     def _formation_invite_blocked(self, invite: Any) -> bool:
         rows = self.state.db.execute(
@@ -550,9 +539,47 @@ class Daemon:
         if not referee:
             return
         self._read(room)
-        for raw in self.state.events(room):
-            receipt = receipt_candidate(room, raw, referee)
+        for raw in self.state.unprocessed_receipt_events(room):
+            generation = int(raw.pop("_receipt_generation"))
+            seq = int(raw.pop("_receipt_seq"))
+            existing = self.state.db.execute(
+                "SELECT kind,payload,accepted FROM receipts WHERE room=? "
+                "AND generation=? AND seq=?", (room, generation, seq),
+            ).fetchone()
+            if existing is not None:
+                receipt = NormalizedReceipt(
+                    existing["kind"], json.loads(existing["payload"])
+                )
+            else:
+                # Sender equality is a cheap relevance gate. Only messages
+                # attributed to the pinned referee reach Ed25519 verification.
+                if raw.get("from") != referee:
+                    self.state.mark_receipt_event_processed(
+                        room, generation, seq, "done"
+                    )
+                    continue
+                if room == ROOMS.registration:
+                    try:
+                        structural = json.loads(raw.get("text", ""))
+                    except (TypeError, json.JSONDecodeError):
+                        structural = None
+                    if (
+                        not isinstance(structural, dict)
+                        or structural.get("type") not in {
+                            "sonnet.receipt.v1",
+                            "sonnet.registration-accepted.v1",
+                            "sonnet.registration-rejected.v1",
+                        }
+                    ):
+                        self.state.mark_receipt_event_processed(
+                            room, generation, seq, "done"
+                        )
+                        continue
+                receipt = receipt_candidate(room, raw, referee)
             if receipt is None:
+                self.state.mark_receipt_event_processed(
+                    room, generation, seq, "done"
+                )
                 continue
 
             # Ignore referee receipts/notices that do not correspond to one of
@@ -569,11 +596,9 @@ class Daemon:
                 if pending is not None:
                     pending["request_id"] = request_id
 
-            if pending is None:
-                continue
-
             if (
-                receipt.kind == "unknown"
+                pending is not None
+                and receipt.kind == "unknown"
                 and receipt.payload.get("type") != "sonnet.receipt.v1"
                 and self.cfg.openai_api_key_file is not None
             ):
@@ -586,16 +611,23 @@ class Daemon:
                     receipt = normalize_llm_receipt(normalized)
                 except LLMUnavailable as exc:
                     self.state.set("last_error", f"LLMUnavailable: {exc}")
-            accepted = bool(pending and receipt_matches(receipt, pending))
-            with self.state.db:
-                inserted = self.state.db.execute(
-                    "INSERT OR IGNORE INTO receipts(room,generation,seq,kind,payload,accepted) VALUES(?,?,?,?,?,?)",
-                    (room, int(raw.get("_room_generation") or -1), int(raw.get("seq", 0)), receipt.kind,
-                     json.dumps(receipt.payload), int(accepted)),
-                ).rowcount
-            if not inserted:
-                continue
-            if not accepted:
+            actionable = bool(pending and receipt_matches(receipt, pending))
+            trusted_registration = (
+                room == ROOMS.registration
+                and receipt.kind == "registration_accepted"
+            )
+            accepted = actionable or trusted_registration
+            if existing is None:
+                with self.state.db:
+                    self.state.db.execute(
+                        "INSERT OR IGNORE INTO receipts(room,generation,seq,kind,payload,accepted) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (room, generation, seq, receipt.kind,
+                         json.dumps(receipt.payload), int(accepted)),
+                    )
+            self.state.mark_receipt_event_processed(room, generation, seq, "normalized")
+            if not actionable:
+                self.state.mark_receipt_event_processed(room, generation, seq, "done")
                 continue
             self._journal(
                 "receipt_accepted",
@@ -705,6 +737,7 @@ class Daemon:
             elif receipt.kind == "submission_rejected":
                 self.state.set_request_status(request_id, "rejected")
                 self.state.set("submission_state", "rejected")
+            self.state.mark_receipt_event_processed(room, generation, seq, "done")
 
     def _discovery(self) -> None:
         # Trusted referee terminal facts are processed before every local
@@ -714,7 +747,7 @@ class Daemon:
             return
         # Recruitment authority comes from referee-accepted registration
         # evidence, never from a note's self-declared role.
-        self._read(ROOMS.registration)
+        self._receipts(ROOMS.registration)
         self._bootstrap_formation_state()
         self._reconcile_formation_transport()
         active_epoch = TeamFormationStore(self.state).active_epoch()

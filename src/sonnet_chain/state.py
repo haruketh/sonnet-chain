@@ -58,6 +58,11 @@ class StateStore:
               payload TEXT NOT NULL, accepted INTEGER NOT NULL,
               PRIMARY KEY(room, generation, seq)
             );
+            CREATE TABLE IF NOT EXISTS receipt_processing (
+              room TEXT NOT NULL, generation INTEGER NOT NULL, seq INTEGER NOT NULL,
+              status TEXT NOT NULL, processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(room,generation,seq)
+            );
             CREATE TABLE IF NOT EXISTS teams (
               game_id TEXT PRIMARY KEY, payload TEXT NOT NULL, score REAL
             );
@@ -126,6 +131,16 @@ class StateStore:
                 "ALTER TABLE team_events ADD COLUMN source_ordinal INTEGER NOT NULL DEFAULT 0"
             )
             self.db.commit()
+        # A normalized registration_accepted row could only have been created
+        # after pinned-referee signature and schema verification. Historically
+        # `accepted` meant "matched Saruku's pending request"; for registration
+        # facts it now records the trusted referee's accepted status instead.
+        with self.db:
+            self.db.execute(
+                "UPDATE receipts SET accepted=1 WHERE room=? "
+                "AND kind='registration_accepted'",
+                (ROOMS.registration,),
+            )
         # Conservative v0.2 bootstrap: a legacy pending official mutation may
         # already have crossed the network boundary. Absence of a new table row
         # is not evidence that consent/withdrawal was never attempted.
@@ -346,3 +361,31 @@ class StateStore:
             if payload.get("role") == "writer" and isinstance(did, str):
                 writers.add(did)
         return writers
+
+    def unprocessed_receipt_events(self, room: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT e.generation,e.seq,e.payload FROM events e "
+            "LEFT JOIN receipt_processing p ON p.room=e.room "
+            "AND p.generation=e.generation AND p.seq=e.seq "
+            "WHERE e.room=? AND (p.seq IS NULL OR p.status<>'done') "
+            "ORDER BY e.generation,e.seq",
+            (room,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            payload["_receipt_generation"] = row["generation"]
+            payload["_receipt_seq"] = row["seq"]
+            out.append(payload)
+        return out
+
+    def mark_receipt_event_processed(
+        self, room: str, generation: int, seq: int, status: str,
+    ) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO receipt_processing(room,generation,seq,status) "
+                "VALUES(?,?,?,?) ON CONFLICT(room,generation,seq) DO UPDATE SET "
+                "status=excluded.status,processed_at=CURRENT_TIMESTAMP",
+                (room, generation, seq, status),
+            )
