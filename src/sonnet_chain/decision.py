@@ -75,6 +75,9 @@ class DecisionState:
     escalation_stage: EscalationStage
     previous_contributor: str | None
     pending_word_request: bool
+    quality_generation_exhausted_for_current_state: bool
+    emergency_fallback_attempted_for_current_state: bool
+    saruku_no_feasible_word_for_current_state: bool
     roster: tuple[str, ...]
     uncovered_members: tuple[str, ...]
     uncovered_count: int
@@ -194,6 +197,8 @@ def build_decision_state(*, runtime: dict[str, Any], snapshot: dict[str, Any], n
             or not runtime.get("current_state_hash")
             or runtime.get("previous_contributor") == SARUKU_DID or pending_word):
         legal.discard(Action.SARUKU_PROPOSE_WORD)
+    if runtime.get("saruku_no_feasible_word_for_current_state") is True:
+        legal.discard(Action.SARUKU_PROPOSE_WORD)
     saruku_covered = SARUKU_DID not in uncovered
     if slack <= 0 and saruku_covered:
         legal.discard(Action.SARUKU_PROPOSE_WORD)
@@ -201,7 +206,10 @@ def build_decision_state(*, runtime: dict[str, Any], snapshot: dict[str, Any], n
         str(runtime["game_id"]), str(runtime["poem_room"]), int(runtime["room_generation"]),
         int(runtime["current_version"]), str(runtime.get("current_state_hash") or ""),
         int(runtime.get("current_line", 1)), int(runtime.get("current_line_syllables", 0)),
-        last, stall, stage, runtime.get("previous_contributor"), pending_word, roster,
+        last, stall, stage, runtime.get("previous_contributor"), pending_word,
+        bool(runtime.get("quality_generation_exhausted_for_current_state")),
+        bool(runtime.get("emergency_fallback_attempted_for_current_state")),
+        bool(runtime.get("saruku_no_feasible_word_for_current_state")), roster,
         uncovered, len(uncovered), SARUKU_DID in uncovered, eligible_uncovered,
         remain, slack, coverage_pressure(slack),
         grouped["SELF_COMMITMENT"], grouped["NOMINATION"], grouped["REQUEST"],
@@ -285,6 +293,13 @@ def _deterministic_policy(state: DecisionState, now: datetime) -> Decision | Non
         state.active_requests_to_saruku
         and Action.SARUKU_PROPOSE_WORD in state.legal_actions
         and qualification_preserved(state, 1)
+        and (
+            not state.quality_generation_exhausted_for_current_state
+            or (
+                state.escalation_stage == EscalationStage.STAGE_2_PROGRESS
+                and not state.emergency_fallback_attempted_for_current_state
+            )
+        )
     ):
         return _decision(state, Action.SARUKU_PROPOSE_WORD, "direct_next_word_request", now)
     if state.relevant_open_questions and coordination_sendable(
