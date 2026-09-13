@@ -167,6 +167,59 @@ class TeamIntelligence:
         self.store = store
         self.llm = llm
 
+    def sync_sources(
+        self, room: str, generation: int, allowed_senders: set[str],
+        referee_did: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Verify each potentially relevant room record once across restarts."""
+        scope = "referee" if referee_did is not None and allowed_senders == {referee_did} else "semantic"
+        for raw in self.store.unprocessed_team_sources(room, generation, scope):
+            try:
+                seq = int(raw.get("seq", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            sender, text = raw.get("from"), raw.get("text")
+            if not isinstance(sender, str) or not isinstance(text, str):
+                self.store.mark_team_source_processed(room, generation, seq, scope)
+                continue
+            cached = self.store.verified_team_source(room, generation, seq)
+            if cached is not None:
+                self.store.mark_team_source_processed(room, generation, seq, scope)
+                continue
+            if sender not in allowed_senders:
+                # A room-open probe initially knows only the referee. Preserve
+                # possible peer messages until the trusted roster is known.
+                self.store.mark_team_source_processed(room, generation, seq, scope)
+                continue
+            receipt_verified = (
+                sender == referee_did
+                and self.store.has_verified_receipt(room, generation, seq)
+            )
+            if not receipt_verified and not verify_room_signature(
+                room, sender, raw.get("nonce", ""), text, raw.get("sig", "")
+            ):
+                self.store.mark_team_source_processed(room, generation, seq, scope)
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = None
+            kind = payload.get("type") if isinstance(payload, dict) else None
+            request_id = payload.get("request_id") if isinstance(payload, dict) else None
+            self.store.persist_team_source(
+                room, generation, seq, sender, raw, kind,
+                request_id if isinstance(request_id, str) else None, scope,
+            )
+            if (
+                sender == referee_did and isinstance(payload, dict)
+                and payload.get("contest_id") == CONTEST_ID
+                and (kind == "sonnet.word-accepted.v1" or (
+                    kind == "sonnet.receipt.v1" and payload.get("status") == "accepted"
+                ))
+            ):
+                self.store.close_team_room(room, generation, seq)
+        return self.store.verified_team_sources(room, generation)
+
     @staticmethod
     def _event_id(source: Source, ordinal: int, event_type: str) -> str:
         raw = (
@@ -412,10 +465,7 @@ class TeamIntelligence:
         member_set = set(members)
         llm_budget = [max_llm_messages]
         self._materialize_member_facts(game_id, room, generation, members, referee_did, line)
-        events = [
-            event for event in self.store.events(room)
-            if event.get("_room_generation") == generation
-        ]
+        events = self.sync_sources(room, generation, member_set | ({referee_did} if referee_did else set()), referee_did)
         for raw in events:
             speaker = raw.get("from")
             text = raw.get("text")
@@ -424,8 +474,6 @@ class TeamIntelligence:
             except (TypeError, ValueError):
                 continue
             if not isinstance(speaker, str) or not isinstance(text, str):
-                continue
-            if not verify_room_signature(room, speaker, raw.get("nonce", ""), text, raw.get("sig", "")):
                 continue
             source = Source(
                 game_id, room, generation, seq, speaker, version, line,

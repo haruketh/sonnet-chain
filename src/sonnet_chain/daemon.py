@@ -25,7 +25,6 @@ from .invites import (
     choose_invite,
     direct_invite,
     expired_application_games,
-    invite_room_is_open,
     pending_application,
     record_time,
 )
@@ -37,7 +36,7 @@ from .publisher import CommandPublisher, PublisherAuthRequired, PublisherUnavail
 from .receipts import NormalizedReceipt, normalize_llm_receipt, receipt_candidate, receipt_matches
 from .rosters import (
     CanonicalRoster, current_roster_signers, roster_consensus, signed_roster,
-    signed_withdrawal, team_room_is_open,
+    signed_withdrawal,
 )
 from .state import Phase, StateStore
 from .team_intelligence import TeamIntelligence, capability_announcement
@@ -104,8 +103,11 @@ class Daemon:
         )
 
     def _read(self, room: str) -> list[dict[str, Any]]:
+        return self._read_incremental(room, getattr(self, "wait", 0))
+
+    def _read_incremental(self, room: str, wait: int = 0) -> list[dict[str, Any]]:
         cursor, stored_generation = self.state.cursor(room)
-        page = self.tc.read_page(room, cursor, self.wait)
+        page = self.tc.read_page(room, cursor, wait)
         records, generation = page
         if stored_generation is not None and generation is not None and generation != stored_generation:
             self.state.reset_cursor(room, generation)
@@ -115,8 +117,10 @@ class Daemon:
             self.state.reset_cursor(room, generation)
         fresh = []
         for record in records:
-            if self.state.record_event(room, record.seq, generation, record.raw):
-                fresh.append(record.raw)
+            raw = record.raw if hasattr(record, "raw") else record
+            seq = record.seq if hasattr(record, "seq") else raw.get("seq", 0)
+            if isinstance(raw, dict) and self.state.record_event(room, int(seq), generation, raw):
+                fresh.append(raw)
         if generation is not None:
             rows = self.state.db.execute(
                 "SELECT seq FROM events WHERE room=? AND generation=? ORDER BY seq",
@@ -223,6 +227,35 @@ class Daemon:
 
     def _trusted_writer_dids(self) -> set[str]:
         return self.state.trusted_writer_dids()
+
+    def _team_room_open(self, candidate: Any, referee_did: str) -> bool:
+        room = candidate.poem_room
+        expected_generation = candidate.room_generation
+        cache = getattr(self, "_team_room_open_cache", None)
+        if cache is None:
+            cache = self._team_room_open_cache = {}
+        key = (room, expected_generation, referee_did)
+        if key in cache:
+            return cache[key]
+        if owner_did(self.tc.owner_note(room)) != referee_did:
+            cache[key] = False
+            return False
+        self._read_incremental(room, 0)
+        _, actual_generation = self.state.cursor(room)
+        if actual_generation != expected_generation:
+            cache[key] = False
+            return False
+        TeamIntelligence(self.state).sync_sources(
+            room, expected_generation, {referee_did}, referee_did,
+        )
+        if self.state.team_room_closed(room, expected_generation):
+            cache[key] = False
+            return False
+        history = TeamFormationStore(self.state).load_history(room, expected_generation)
+        cache[key] = bool(
+            history is not None and history.is_complete(1, history.highest_observed_seq)
+        )
+        return cache[key]
 
     def _sync_formation_events(self) -> None:
         """Verify each relevant Discovery record once, then use durable facts."""
@@ -834,6 +867,7 @@ class Daemon:
             self.state.mark_receipt_event_processed(room, generation, seq, "done")
 
     def _discovery(self) -> None:
+        self._team_room_open_cache = {}
         # Trusted referee terminal facts are processed before every local
         # formation heuristic.
         self._receipts(ROOMS.discovery)
@@ -979,9 +1013,7 @@ class Daemon:
                         referee = self.state.get("referee_did")
                         if not isinstance(referee, str):
                             continue
-                        owner = self.tc.owner_note(invite.poem_room)
-                        records, generation = self.tc.read_page(invite.poem_room, 0, 0)
-                        if not invite_room_is_open(invite, referee, owner, generation, records):
+                        if not self._team_room_open(invite, referee):
                             continue
                         room_verified = True
                     candidates.append(InviteCandidate(invite, room_verified))
@@ -1011,12 +1043,8 @@ class Daemon:
                                 roster.poem_room, roster.room_generation
                             ) in verified_rooms:
                                 continue
-                            owner = self.tc.owner_note(roster.poem_room)
-                            room_records, actual_generation = self.tc.read_page(
-                                roster.poem_room, 0, 0
-                            )
-                            verified_rooms[(roster.poem_room, roster.room_generation)] = team_room_is_open(
-                                roster, referee, owner, actual_generation, room_records
+                            verified_rooms[(roster.poem_room, roster.room_generation)] = self._team_room_open(
+                                roster, referee
                             )
                         reduced = reduce_candidate_states(
                             discovery_events, opportunities, verified_rooms
@@ -1131,14 +1159,9 @@ class Daemon:
                         ), None)
                         joinable = False
                         if complete and replacement_roster is not None:
-                            owner = self.tc.owner_note(replacement_roster.poem_room)
-                            room_records, room_generation = self.tc.read_page(
-                                replacement_roster.poem_room, 0, 0
-                            )
                             referee = self.state.get("referee_did")
-                            joinable = isinstance(referee, str) and team_room_is_open(
-                                replacement_roster, referee, owner,
-                                room_generation, room_records,
+                            joinable = isinstance(referee, str) and self._team_room_open(
+                                replacement_roster, referee
                             )
                         if joinable and active_epoch.maybe_start_replacement_recovery(now_utc):
                             TeamFormationStore(self.state).save_epoch(active_epoch)
@@ -1374,9 +1397,7 @@ class Daemon:
                 ):
                     return self._discovery()
                 continue
-            owner = self.tc.owner_note(proposal.poem_room)
-            records, generation = self.tc.read_page(proposal.poem_room, 0, 0)
-            if not team_room_is_open(proposal, referee, owner, generation, records):
+            if not self._team_room_open(proposal, referee):
                 continue
             self._journal(
                 "formation_roster_affirmed_by_recruitment", game_id=proposal.game_id,
@@ -1445,6 +1466,7 @@ class Daemon:
         self.state.set("roster_wait_soft_timeout_noted", False)
 
     def _wait_roster_ready(self) -> None:
+        self._team_room_open_cache = {}
         # Referee resolution wins every race. Process receipts first.
         self._receipts(ROOMS.discovery)
         self._sync_formation_events()
@@ -1668,17 +1690,7 @@ class Daemon:
         referee = self.state.get("referee_did")
         if not isinstance(referee, str):
             return
-        owner = self.tc.owner_note(poem_room)
-        room_records, actual_generation = self.tc.read_page(
-            poem_room, 0, 0
-        )
-        withdrawal_legal = team_room_is_open(
-            target,
-            referee,
-            owner,
-            actual_generation,
-            room_records,
-        )
+        withdrawal_legal = self._team_room_open(target, referee)
         epoch = TeamFormationStore(self.state).active_epoch()
         if epoch is not None:
             epoch.epoch_high_watermark_at = progress_at.astimezone(timezone.utc).isoformat()

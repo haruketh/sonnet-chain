@@ -85,6 +85,27 @@ class StateStore:
               last_error_code TEXT, processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               PRIMARY KEY(game_id,room,generation,seq,extractor_version)
             );
+            CREATE TABLE IF NOT EXISTS team_source_events (
+              room TEXT NOT NULL, generation INTEGER NOT NULL, seq INTEGER NOT NULL,
+              sender_did TEXT NOT NULL, event_type TEXT, request_id TEXT,
+              payload TEXT NOT NULL, verified INTEGER NOT NULL CHECK(verified=1),
+              PRIMARY KEY(room,generation,seq)
+            );
+            CREATE INDEX IF NOT EXISTS team_source_request
+              ON team_source_events(room,generation,request_id);
+            CREATE TABLE IF NOT EXISTS team_source_processing (
+              room TEXT NOT NULL, generation INTEGER NOT NULL, seq INTEGER NOT NULL,
+              referee_checked INTEGER NOT NULL DEFAULT 0,
+              semantic_checked INTEGER NOT NULL DEFAULT 0,
+              processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(room,generation,seq)
+            );
+            CREATE TABLE IF NOT EXISTS team_room_status (
+              room TEXT NOT NULL, generation INTEGER NOT NULL,
+              closed INTEGER NOT NULL DEFAULT 0, terminal_seq INTEGER,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(room,generation)
+            );
             CREATE TABLE IF NOT EXISTS team_context_snapshots (
               game_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL,
               reducer_version INTEGER NOT NULL, ledger_high_watermark TEXT NOT NULL,
@@ -161,6 +182,15 @@ class StateStore:
         ):
             if name not in history_columns:
                 self.db.execute(f"ALTER TABLE formation_history_state ADD COLUMN {name} {definition}")
+        self.db.commit()
+        source_processing_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(team_source_processing)").fetchall()
+        }
+        for name in ("referee_checked", "semantic_checked"):
+            if name not in source_processing_columns:
+                self.db.execute(
+                    f"ALTER TABLE team_source_processing ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+                )
         self.db.commit()
         # A normalized registration_accepted row could only have been created
         # after pinned-referee signature and schema verification. Historically
@@ -285,6 +315,85 @@ class StateStore:
             "SELECT payload FROM events WHERE room=? ORDER BY generation,seq", (room,)
         ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def unprocessed_team_sources(
+        self, room: str, generation: int, scope: str,
+    ) -> list[dict[str, Any]]:
+        column = "referee_checked" if scope == "referee" else "semantic_checked"
+        rows = self.db.execute(
+            "SELECT e.seq,e.payload FROM events e LEFT JOIN team_source_processing p "
+            "ON p.room=e.room AND p.generation=e.generation AND p.seq=e.seq "
+            f"WHERE e.room=? AND e.generation=? AND (p.seq IS NULL OR p.{column}=0) ORDER BY e.seq",
+            (room, generation),
+        ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def persist_team_source(
+        self, room: str, generation: int, seq: int, sender: str, raw: dict[str, Any],
+        event_type: str | None, request_id: str | None, scope: str,
+    ) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO team_source_events(room,generation,seq,sender_did,"
+                "event_type,request_id,payload,verified) VALUES(?,?,?,?,?,?,?,1)",
+                (room, generation, seq, sender, event_type, request_id,
+                 json.dumps(raw, ensure_ascii=False, separators=(",", ":"))),
+            )
+            self._mark_team_source_processed_sql(room, generation, seq, scope)
+
+    def _mark_team_source_processed_sql(
+        self, room: str, generation: int, seq: int, scope: str,
+    ) -> None:
+        referee = int(scope == "referee"); semantic = int(scope != "referee")
+        self.db.execute(
+            "INSERT INTO team_source_processing(room,generation,seq,referee_checked,semantic_checked) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(room,generation,seq) DO UPDATE SET "
+            "referee_checked=max(referee_checked,excluded.referee_checked),"
+            "semantic_checked=max(semantic_checked,excluded.semantic_checked),"
+            "processed_at=CURRENT_TIMESTAMP",
+            (room, generation, seq, referee, semantic),
+        )
+
+    def mark_team_source_processed(
+        self, room: str, generation: int, seq: int, scope: str,
+    ) -> None:
+        with self.db:
+            self._mark_team_source_processed_sql(room, generation, seq, scope)
+
+    def verified_team_source(self, room: str, generation: int, seq: int) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT payload FROM team_source_events WHERE room=? AND generation=? AND seq=?",
+            (room, generation, seq),
+        ).fetchone()
+        return None if row is None else json.loads(row["payload"])
+
+    def has_verified_receipt(self, room: str, generation: int, seq: int) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM receipts WHERE room=? AND generation=? AND seq=?",
+            (room, generation, seq),
+        ).fetchone() is not None
+
+    def verified_team_sources(self, room: str, generation: int) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT payload FROM team_source_events WHERE room=? AND generation=? ORDER BY seq",
+            (room, generation),
+        ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def close_team_room(self, room: str, generation: int, seq: int) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO team_room_status(room,generation,closed,terminal_seq) VALUES(?,?,1,?) "
+                "ON CONFLICT(room,generation) DO UPDATE SET closed=1,terminal_seq=max("
+                "coalesce(terminal_seq,0),excluded.terminal_seq),updated_at=CURRENT_TIMESTAMP",
+                (room, generation, seq),
+            )
+
+    def team_room_closed(self, room: str, generation: int) -> bool:
+        row = self.db.execute(
+            "SELECT closed FROM team_room_status WHERE room=? AND generation=?", (room, generation)
+        ).fetchone()
+        return bool(row and row["closed"])
 
     def unprocessed_formation_events(self, room: str) -> list[dict[str, Any]]:
         rows = self.db.execute(
