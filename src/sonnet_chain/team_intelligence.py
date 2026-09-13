@@ -18,10 +18,23 @@ REDUCER_VERSION = 1
 MAX_ANALYSIS_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = (60, 300)
 CAPABILITY_TEXT = (
-    "I can help coordinate turns, syllables, DID-letter constraints, and contributor coverage.\n"
+    "I’m Saruku. I can help coordinate turns, syllables, DID-letter constraints, and contributor coverage.\n"
     "If I become the final contributor, I can publish the exact frozen poem from my registered X "
     "account and submit it."
 )
+TRUSTED_SELF_ALIASES = frozenset({"saruku", "@saruku"})
+
+
+def resolve_target(target_text: str | None, members: set[str]) -> str | None:
+    if target_text in members:
+        return target_text
+    if (
+        isinstance(target_text, str)
+        and target_text.strip().casefold() in TRUSTED_SELF_ALIASES
+        and SARUKU_DID in members
+    ):
+        return SARUKU_DID
+    return None
 
 TEAM_MESSAGE_SCHEMA = {
     "type": "object",
@@ -53,8 +66,29 @@ TEAM_MESSAGE_SCHEMA = {
                     "value": {"type": ["string", "number", "boolean", "null"]},
                     "scope": {"type": "string", "enum": ["next_word", "current_line", "poem"]},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "requested_word": {"type": ["string", "null"], "maxLength": 64},
+                    "lexical_constraint": {
+                        "anyOf": [
+                            {"type": "null"},
+                            {"type": "object", "properties": {
+                                "type": {"type": "string", "enum": ["prefix", "suffix"]},
+                                "value": {"type": "string", "maxLength": 32},
+                            }, "required": ["type", "value"], "additionalProperties": False},
+                        ]
+                    },
+                    "semantic_constraint": {
+                        "anyOf": [
+                            {"type": "null"},
+                            {"type": "object", "properties": {
+                                "type": {"type": "string", "enum": ["topic"]},
+                                "value": {"type": "string", "maxLength": 64},
+                            }, "required": ["type", "value"], "additionalProperties": False},
+                        ]
+                    },
                 },
-                "required": ["proposal_type", "proposal_mode", "target_text", "value", "scope", "confidence"],
+                "required": ["proposal_type", "proposal_mode", "target_text", "value", "scope",
+                             "confidence", "requested_word", "lexical_constraint",
+                             "semantic_constraint"],
                 "additionalProperties": False,
             },
         },
@@ -241,7 +275,9 @@ class TeamIntelligence:
             raise ValueError("invalid unclassified items")
         required = {
             "claims": {"predicate", "value", "scope", "confidence"},
-            "proposals": {"proposal_type", "proposal_mode", "target_text", "value", "scope", "confidence"},
+            "proposals": {"proposal_type", "proposal_mode", "target_text", "value", "scope",
+                          "confidence", "requested_word", "lexical_constraint",
+                          "semantic_constraint"},
             "questions": {"text", "target_text", "confidence"},
             "constraints": {"predicate", "value", "scope", "confidence"},
             "retractions": {"predicate", "scope", "confidence"},
@@ -257,6 +293,28 @@ class TeamIntelligence:
                     "next_word", "current_line", "poem"
                 }:
                     raise ValueError("invalid semantic scope")
+                if group == "proposals":
+                    requested = item["requested_word"]
+                    lexical = item["lexical_constraint"]
+                    semantic = item["semantic_constraint"]
+                    if requested is not None and (
+                        not isinstance(requested, str) or not requested or len(requested) > 64
+                    ):
+                        raise ValueError("invalid requested word")
+                    if lexical is not None and (
+                        not isinstance(lexical, dict) or set(lexical) != {"type", "value"}
+                        or lexical["type"] not in {"prefix", "suffix"}
+                        or not isinstance(lexical["value"], str)
+                        or not lexical["value"] or len(lexical["value"]) > 32
+                    ):
+                        raise ValueError("invalid lexical constraint")
+                    if semantic is not None and (
+                        not isinstance(semantic, dict) or set(semantic) != {"type", "value"}
+                        or semantic["type"] != "topic"
+                        or not isinstance(semantic["value"], str)
+                        or not semantic["value"] or len(semantic["value"]) > 64
+                    ):
+                        raise ValueError("invalid semantic constraint")
         return value
 
     def _extract_planning(
@@ -271,8 +329,10 @@ class TeamIntelligence:
         try:
             extracted = self._valid_extraction(self.llm.structured(
                 "Extract claims, proposals, questions, constraints, and retractions from this signed "
-                "planning text. The verified speaker is supplied as metadata and must not be inferred from "
-                "the text. Return natural-language targets only as target_text; never resolve aliases to DIDs.",
+                "planning text, including bounded requested_word, prefix/suffix lexical constraints, and "
+                "topic semantic constraints when explicit. The verified speaker is supplied as metadata "
+                "and must not be inferred from the text. Return natural-language targets only as target_text; "
+                "never resolve aliases to DIDs.",
                 {
                     "verified_speaker_did": source.speaker,
                     "room": source.room,
@@ -301,8 +361,8 @@ class TeamIntelligence:
             ordinal += 1
             target_text = item.get("target_text") if isinstance(item.get("target_text"), str) else None
             mode = item["proposal_mode"]
-            resolved = source.speaker if mode == "SELF_COMMITMENT" else (
-                target_text if target_text in members else None
+            resolved = source.speaker if mode == "SELF_COMMITMENT" else resolve_target(
+                target_text, members
             )
             self._append(
                 source, ordinal, "CLAIM", "proposal", actor=source.speaker, subject=resolved,
@@ -311,14 +371,17 @@ class TeamIntelligence:
                 confidence=float(item.get("confidence", 0)),
                 extra={"observed_at_version": source.poem_version,
                        "observed_at_line": source.poem_line,
-                       "proposal_mode": mode},
+                       "proposal_mode": mode,
+                       "requested_word": item["requested_word"],
+                       "lexical_constraint": item["lexical_constraint"],
+                       "semantic_constraint": item["semantic_constraint"]},
             )
         for group, event_type in (("questions", "question"), ("constraints", "constraint"),
                                   ("retractions", "retraction")):
             for item in extracted[group]:
                 ordinal += 1
                 target_text = item.get("target_text") if isinstance(item.get("target_text"), str) else None
-                resolved = target_text if target_text in members else None
+                resolved = resolve_target(target_text, members)
                 self._append(
                     source, ordinal, "CLAIM", event_type, actor=source.speaker, subject=resolved,
                     scope=item.get("scope"), predicate=item.get("predicate"),
@@ -549,6 +612,12 @@ class TeamIntelligence:
                     "resolved_target_did": row["resolved_target_did"],
                     "proposal_type": row["predicate"], "scope": row["scope"],
                     "proposal_mode": row["payload"]["semantic"].get("proposal_mode", "PREFERENCE"),
+                    "requested_word": row["payload"]["semantic"].get("requested_word"),
+                    "lexical_constraint": row["payload"]["semantic"].get("lexical_constraint"),
+                    "semantic_constraint": row["payload"]["semantic"].get("semantic_constraint"),
+                    "source_event_id": row["event_id"],
+                    "extraction_confidence": row["extraction_confidence"],
+                    "provenance": row["payload"]["source"],
                     "value": row["value"],
                     "observed_at_version": row["source_poem_version"],
                     "observed_at_line": row["payload"]["source"].get(
@@ -636,6 +705,10 @@ class TeamIntelligence:
             "previous_contributor": contributors[-1] if contributors else None,
             "members": members,
             "active_proposals": active_proposals,
+            "active_writing_requests": [
+                proposal for proposal in active_proposals
+                if proposal["proposal_mode"] == "REQUEST"
+            ],
             "stale_proposals": stale_proposals,
             "superseded_proposals": superseded_proposals,
             "terminal_risks": risks,

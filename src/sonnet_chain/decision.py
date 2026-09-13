@@ -78,6 +78,8 @@ class DecisionState:
     roster: tuple[str, ...]
     uncovered_members: tuple[str, ...]
     uncovered_count: int
+    saruku_is_uncovered: bool
+    eligible_uncovered_coordination_targets: tuple[str, ...]
     remaining_syllables_total: int
     coverage_slack: int
     coverage_pressure: CoveragePressure
@@ -85,6 +87,9 @@ class DecisionState:
     active_nominations: tuple[dict[str, Any], ...]
     active_requests: tuple[dict[str, Any], ...]
     active_preferences: tuple[dict[str, Any], ...]
+    active_requests_to_saruku: tuple[dict[str, Any], ...]
+    active_nominations_of_saruku: tuple[dict[str, Any], ...]
+    active_writing_requests: tuple[dict[str, Any], ...]
     terminal_publish_risks: tuple[dict[str, Any], ...]
     relevant_open_questions: tuple[dict[str, Any], ...]
     legal_actions: frozenset[Action]
@@ -154,6 +159,7 @@ def build_decision_state(*, runtime: dict[str, Any], snapshot: dict[str, Any], n
     members = snapshot.get("members", {})
     uncovered = tuple(x for x in roster if not members.get(x, {}).get("facts", {}).get(
         "has_contributed", False))
+    eligible_uncovered = tuple(x for x in uncovered if x != SARUKU_DID)
     remain = remaining_syllables(int(runtime.get("current_line", 1)),
                                  int(runtime.get("current_line_syllables", 0)))
     slack = remain - len(uncovered)
@@ -168,6 +174,21 @@ def build_decision_state(*, runtime: dict[str, Any], snapshot: dict[str, Any], n
         commitment_waits or {},
     )
     grouped["SELF_COMMITMENT"] = active_commitments
+    current_requests = tuple(
+        proposal for proposal in grouped["REQUEST"]
+        if proposal.get("scope") == "next_word"
+        and proposal.get("observed_at_version") == int(runtime["current_version"])
+    )
+    requests_to_saruku = tuple(
+        proposal for proposal in current_requests
+        if proposal.get("resolved_target_did") == SARUKU_DID
+    )
+    nominations_of_saruku = tuple(
+        proposal for proposal in grouped["NOMINATION"]
+        if proposal.get("scope") == "next_word"
+        and proposal.get("observed_at_version") == int(runtime["current_version"])
+        and proposal.get("resolved_target_did") == SARUKU_DID
+    )
     legal = {Action.WAIT, Action.COORDINATE, Action.SARUKU_PROPOSE_WORD}
     if (phase != Phase.WRITING or not deadline_ok or runtime.get("poem_complete")
             or not runtime.get("current_state_hash")
@@ -181,14 +202,18 @@ def build_decision_state(*, runtime: dict[str, Any], snapshot: dict[str, Any], n
         int(runtime["current_version"]), str(runtime.get("current_state_hash") or ""),
         int(runtime.get("current_line", 1)), int(runtime.get("current_line_syllables", 0)),
         last, stall, stage, runtime.get("previous_contributor"), pending_word, roster,
-        uncovered, len(uncovered), remain, slack, coverage_pressure(slack),
+        uncovered, len(uncovered), SARUKU_DID in uncovered, eligible_uncovered,
+        remain, slack, coverage_pressure(slack),
         grouped["SELF_COMMITMENT"], grouped["NOMINATION"], grouped["REQUEST"],
-        grouped["PREFERENCE"], tuple(snapshot.get("terminal_risks", [])),
+        grouped["PREFERENCE"], requests_to_saruku, nominations_of_saruku,
+        tuple(snapshot.get("active_writing_requests", [])),
+        tuple(snapshot.get("terminal_risks", [])),
         tuple(snapshot.get("questions", [])), frozenset(legal), True, False,
         frozenset(coordination_sent or set()), wait_records,
         str(snapshot.get("ledger_high_watermark", "")),
     )
     target = uncovered[0] if uncovered else None
+    target = eligible_uncovered[0] if eligible_uncovered else None
     intent = "ask_uncovered_member_to_contribute" if target else "observe_progress"
     sent = coordination_key(provisional, target, intent) in (coordination_sent or set())
     return DecisionState(**{**asdict(provisional), "roster": roster, "uncovered_members": uncovered,
@@ -196,6 +221,11 @@ def build_decision_state(*, runtime: dict[str, Any], snapshot: dict[str, Any], n
                             "active_nominations": grouped["NOMINATION"],
                             "active_requests": grouped["REQUEST"],
                             "active_preferences": grouped["PREFERENCE"],
+                            "active_requests_to_saruku": requests_to_saruku,
+                            "active_nominations_of_saruku": nominations_of_saruku,
+                            "active_writing_requests": tuple(snapshot.get(
+                                "active_writing_requests", []
+                            )),
                             "terminal_publish_risks": tuple(snapshot.get("terminal_risks", [])),
                             "relevant_open_questions": tuple(snapshot.get("questions", [])),
                             "legal_actions": frozenset(legal),
@@ -251,6 +281,12 @@ def _decision(state: DecisionState, action: Action, reason: str, now: datetime,
 def _deterministic_policy(state: DecisionState, now: datetime) -> Decision | None:
     if state.pending_word_request:
         return _decision(state, Action.WAIT, "pending_word_reconciliation", now)
+    if (
+        state.active_requests_to_saruku
+        and Action.SARUKU_PROPOSE_WORD in state.legal_actions
+        and qualification_preserved(state, 1)
+    ):
+        return _decision(state, Action.SARUKU_PROPOSE_WORD, "direct_next_word_request", now)
     if state.relevant_open_questions and coordination_sendable(
         state, None, "answer_direct_question"
     ):
@@ -261,22 +297,24 @@ def _deterministic_policy(state: DecisionState, now: datetime) -> Decision | Non
         if coordination_sendable(state, target, "warn_terminal_publisher_risk"):
             return _decision(state, Action.COORDINATE, "terminal_publisher_risk", now, target,
                              "warn_terminal_publisher_risk")
-    if state.uncovered_members:
+    if state.eligible_uncovered_coordination_targets:
         committed = {p.get("actor_did") for p in state.active_self_commitments
                      if p.get("wait_active") is True}
         expired_commitment = any(
             p.get("wait_active") is False for p in state.active_self_commitments
         )
-        if committed.intersection(state.uncovered_members):
+        if committed.intersection(state.eligible_uncovered_coordination_targets):
             return _decision(state, Action.WAIT, "uncovered_member_self_committed", now)
         if not (
             expired_commitment
             and state.escalation_stage == EscalationStage.STAGE_2_PROGRESS
         ) and coordination_sendable(
-            state, state.uncovered_members[0], "ask_uncovered_member_to_contribute"
+            state, state.eligible_uncovered_coordination_targets[0],
+            "ask_uncovered_member_to_contribute"
         ):
             return _decision(state, Action.COORDINATE, "uncovered_member", now,
-                             state.uncovered_members[0], "ask_uncovered_member_to_contribute")
+                             state.eligible_uncovered_coordination_targets[0],
+                             "ask_uncovered_member_to_contribute")
     if (any(p.get("wait_active") is True for p in state.active_self_commitments)
             and state.escalation_stage != EscalationStage.STAGE_2_PROGRESS):
         return _decision(state, Action.WAIT, "teammate_self_committed", now)
@@ -302,9 +340,12 @@ def validate_decision(decision: Decision, state: DecisionState) -> bool:
             intent in SUPPORTED_COORDINATION_INTENTS
             and (intent not in TARGET_REQUIRED_INTENTS or (
                 decision.target_did is not None and decision.target_did in state.roster
+                and decision.target_did != SARUKU_DID
             ))
             and (intent not in TARGETLESS_INTENTS or decision.target_did is None)
-            and (decision.target_did is None or decision.target_did in state.roster)
+            and (decision.target_did is None or (
+                decision.target_did in state.roster and decision.target_did != SARUKU_DID
+            ))
             and coordination_sendable(state, decision.target_did, intent or "")
         )
     return (decision.action in state.legal_actions

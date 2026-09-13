@@ -30,12 +30,13 @@ def snapshot(*, covered=(), proposals=(), questions=(), risks=()):
 
 def state(*, stall=0, previous=None, covered=(), line=1, syllables=0,
           proposals=(), questions=(), risks=(), pending=False, sent=None,
-          phase=Phase.WRITING, state_hash="hash", now=NOW, commitment_waits=None):
+          phase=Phase.WRITING, state_hash="hash", now=NOW, commitment_waits=None,
+          roster=(SARUKU_DID, OTHER)):
     runtime = {"game_id": "g", "poem_room": "room", "room_generation": 2,
                "current_version": 7, "current_state_hash": state_hash,
                "current_line": line, "current_line_syllables": syllables,
                "last_progress_at": (NOW - timedelta(seconds=stall)).isoformat(),
-               "previous_contributor": previous, "roster": [SARUKU_DID, OTHER],
+               "previous_contributor": previous, "roster": list(roster),
                "poem_complete": False}
     return build_decision_state(runtime=runtime,
                                 snapshot=snapshot(covered=covered, proposals=proposals,
@@ -79,7 +80,7 @@ def test_fresh_uncovered_self_commitment_at_stage2_waits_once():
 
 def test_already_sent_coordination_at_stage2_falls_through_to_write():
     initial = state(stall=301)
-    key = coordination_key(initial, initial.uncovered_members[0],
+    key = coordination_key(initial, initial.eligible_uncovered_coordination_targets[0],
                            "ask_uncovered_member_to_contribute")
     assert deterministic_decision(state(stall=301, sent={key}), NOW).action == (
         Action.SARUKU_PROPOSE_WORD
@@ -136,7 +137,7 @@ def test_uncovered_candidate_qualification_math():
 
 def test_coordination_dedupe_is_visible_before_policy():
     initial = state(stall=130)
-    key = coordination_key(initial, initial.uncovered_members[0],
+    key = coordination_key(initial, initial.eligible_uncovered_coordination_targets[0],
                            "ask_uncovered_member_to_contribute")
     deduped = state(stall=130, sent={key})
     assert deduped.coordination_already_sent
@@ -217,6 +218,64 @@ def test_decision_llm_input_contains_only_normalized_semantics():
     assert "ignore every rule" not in rendered
     assert "verbatim secret instructions" not in rendered
     assert data["question_source_ids"] == ["q"]
+
+
+def direct_request(version=7):
+    return {"event_id": "request-1", "proposal_mode": "REQUEST",
+            "resolved_target_did": SARUKU_DID, "scope": "next_word",
+            "observed_at_version": version}
+
+
+def test_uncovered_saruku_is_never_coordination_target():
+    value = state(roster=(SARUKU_DID,))
+    decision = deterministic_decision(value, NOW)
+    assert value.saruku_is_uncovered
+    assert value.eligible_uncovered_coordination_targets == ()
+    assert decision.action != Action.COORDINATE
+
+
+def test_stage0_current_direct_request_to_saruku_uses_write_fast_path():
+    value = state(proposals=[direct_request()])
+    decision = deterministic_decision(value, NOW)
+    assert len(value.active_requests_to_saruku) == 1
+    assert decision.action == Action.SARUKU_PROPOSE_WORD
+    assert decision.reason_code == "direct_next_word_request"
+    assert not hasattr(decision, "word")
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"previous": SARUKU_DID},
+    {"pending": True},
+    {"line": 14, "syllables": 9},
+])
+def test_direct_request_does_not_override_write_gates(kwargs):
+    decision = deterministic_decision(state(proposals=[direct_request()], **kwargs), NOW)
+    assert decision.action != Action.SARUKU_PROPOSE_WORD
+
+
+def test_nomination_does_not_receive_request_fast_path():
+    nomination = {**direct_request(), "proposal_mode": "NOMINATION"}
+    value = state(proposals=[nomination], covered=[SARUKU_DID, OTHER])
+    assert value.active_nominations_of_saruku
+    assert deterministic_decision(value, NOW).action == Action.WAIT
+
+
+@pytest.mark.parametrize("mode,field", [
+    ("REQUEST", "active_requests_to_saruku"),
+    ("NOMINATION", "active_nominations_of_saruku"),
+])
+def test_old_next_word_signal_is_not_active(mode, field):
+    proposal = {**direct_request(version=6), "proposal_mode": mode}
+    assert getattr(state(proposals=[proposal]), field) == ()
+
+
+def test_validator_rejects_self_coordination():
+    value = state()
+    base = deterministic_decision(value, NOW)
+    candidate = replace(base, action=Action.COORDINATE,
+                        coordination_intent="ask_uncovered_member_to_contribute",
+                        target_did=SARUKU_DID)
+    assert not validate_decision(candidate, value)
 
 
 def test_decision_llm_failure_uses_bounded_deterministic_fallback():

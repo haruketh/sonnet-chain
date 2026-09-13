@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from sonnet_chain.config import CONTEST_ID, Config, ROOMS, SARUKU_DID
 from sonnet_chain.daemon import Daemon
+from sonnet_chain.decision import Action, build_decision_state, deterministic_decision
 from sonnet_chain.signing import Signer, did_of
 from sonnet_chain.state import Phase, StateStore
 from sonnet_chain.team_intelligence import (
@@ -18,6 +19,7 @@ from sonnet_chain.team_intelligence import (
     TEAM_MESSAGE_SCHEMA,
     TeamIntelligence,
     capability_announcement,
+    resolve_target,
 )
 
 GAME = "intel"
@@ -203,7 +205,8 @@ def test_conflicting_proposals_preserved_and_stale_after_version(tmp_path: Path)
         value["proposals"] = [{
             "proposal_type": "next_writer", "proposal_mode": "NOMINATION",
             "target_text": target, "value": None,
-            "scope": "next_word", "confidence": 0.9,
+            "scope": "next_word", "confidence": 0.9, "requested_word": None,
+            "lexical_constraint": None, "semantic_constraint": None,
         }]
         outputs[text] = value
     store = _store(tmp_path)
@@ -233,7 +236,8 @@ def test_unresolved_alias_remains_null(tmp_path: Path) -> None:
     output["proposals"] = [{
         "proposal_type": "next_writer", "proposal_mode": "NOMINATION",
         "target_text": "Bruce", "value": None,
-        "scope": "next_word", "confidence": 0.9,
+        "scope": "next_word", "confidence": 0.9, "requested_word": None,
+        "lexical_constraint": None, "semantic_constraint": None,
     }]
     store = _store(tmp_path)
     store.record_event(ROOM, 1, GENERATION, _signed(key, _note("Bruce should go"), 1))
@@ -351,7 +355,9 @@ def test_current_line_proposal_stales_and_constraints_are_preserved(tmp_path: Pa
     output = _empty()
     output["proposals"] = [{"proposal_type": "line_shape", "proposal_mode": "PREFERENCE",
                             "target_text": None,
-                            "value": "short", "scope": "current_line", "confidence": 0.8}]
+                            "value": "short", "scope": "current_line", "confidence": 0.8,
+                            "requested_word": None, "lexical_constraint": None,
+                            "semantic_constraint": None}]
     output["constraints"] = [{"predicate": "rhyme", "value": "night",
                               "scope": "current_line", "confidence": 0.9}]
     output["unclassified"] = ["perhaps later"]
@@ -399,6 +405,84 @@ def test_source_ordinal_orders_semantics_within_one_message(tmp_path: Path) -> N
         store.close()
 
 
+def test_writing_request_preserves_bounded_step4_intent(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    speaker = did_of(key)
+    output = _empty()
+    output["proposals"] = [{
+        "proposal_type": "write_next", "proposal_mode": "REQUEST",
+        "target_text": "Saruku", "value": None, "scope": "next_word",
+        "confidence": 0.92, "requested_word": "moon",
+        "lexical_constraint": {"type": "suffix", "value": "ight"},
+        "semantic_constraint": {"type": "topic", "value": "sea"},
+    }]
+    store = _store(tmp_path)
+    store.record_event(ROOM, 1, GENERATION, _signed(
+        key, _note("Saruku, write moon next; use -ight and keep it about the sea."), 1
+    ))
+    try:
+        result = _sync(store, [speaker, SARUKU_DID], FakeLLM({
+            "Saruku, write moon next; use -ight and keep it about the sea.": output
+        }))
+        request = result["active_writing_requests"][0]
+        assert request["resolved_target_did"] == SARUKU_DID
+        assert request["requested_word"] == "moon"
+        assert request["lexical_constraint"] == {"type": "suffix", "value": "ight"}
+        assert request["semantic_constraint"] == {"type": "topic", "value": "sea"}
+        assert request["observed_at_version"] == 0
+        assert request["source_event_id"]
+        assert "Saruku, write moon" not in json.dumps(request)
+    finally:
+        store.close()
+
+
+def test_self_alias_request_reaches_stage0_fast_path(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    speaker = did_of(key)
+    output = _empty()
+    output["proposals"] = [{
+        "proposal_type": "write_next", "proposal_mode": "REQUEST",
+        "target_text": "Saruku", "value": None, "scope": "next_word",
+        "confidence": 0.95, "requested_word": None,
+        "lexical_constraint": None, "semantic_constraint": None,
+    }]
+    store = _store(tmp_path)
+    store.record_event(ROOM, 1, GENERATION, _signed(
+        key, _note("Saruku, take the next word."), 1
+    ))
+    now = datetime.now(timezone.utc)
+    try:
+        snapshot = _sync(store, [speaker, SARUKU_DID], FakeLLM({
+            "Saruku, take the next word.": output
+        }))
+        request = snapshot["active_writing_requests"][0]
+        assert request["resolved_target_did"] == SARUKU_DID
+        decision_state = build_decision_state(
+            runtime={
+                "game_id": GAME, "poem_room": ROOM, "room_generation": GENERATION,
+                "current_version": 0, "current_state_hash": "hash", "current_line": 1,
+                "current_line_syllables": 0, "last_progress_at": now.isoformat(),
+                "previous_contributor": speaker, "roster": [speaker, SARUKU_DID],
+                "poem_complete": False,
+            },
+            snapshot=snapshot, now=now, phase=Phase.WRITING, deadline_ok=True,
+            pending_word=False,
+        )
+        assert decision_state.active_requests_to_saruku[0]["source_event_id"]
+        assert deterministic_decision(decision_state, now).action == Action.SARUKU_PROPOSE_WORD
+    finally:
+        store.close()
+
+
+def test_only_explicit_self_aliases_resolve() -> None:
+    members = {SARUKU_DID, "did:key:zBruce"}
+    assert resolve_target("Saruku", members) == SARUKU_DID
+    assert resolve_target(" @SARUKU ", members) == SARUKU_DID
+    assert resolve_target("Bruce", members) is None
+    assert resolve_target("Saruku!", members) is None
+    assert resolve_target("saruku_bot", members) is None
+
+
 def _writing_daemon(tmp_path: Path) -> Daemon:
     daemon = Daemon.__new__(Daemon)
     daemon.cfg = Config(
@@ -428,6 +512,7 @@ def test_capability_announcement_is_at_most_once_per_game(tmp_path: Path) -> Non
         assert len(posted) == 1
         assert posted[0][0] == ROOM
         assert posted[0][1]["text"] == CAPABILITY_TEXT
+        assert posted[0][1]["text"].startswith("I’m Saruku.")
         assert "If I become the final contributor" in posted[0][1]["text"]
     finally:
         daemon.state.close()
@@ -447,8 +532,7 @@ def test_team_intelligence_failure_does_not_stop_legacy_writing(monkeypatch, tmp
         daemon._writing()
         assert daemon.state.phase == Phase.WRITING
         assert daemon.state.get("last_team_intelligence_error") == "RuntimeError"
-        action = daemon.state.get("dry_run_action")
-        assert action["type"] == "sonnet.note.v1"
-        assert action["purpose"] == "team_coordination"
+        assert daemon.state.get("dry_run_action") is None
+        assert isinstance(daemon.state.get("poem_last_progress_at"), str)
     finally:
         daemon.state.close()
