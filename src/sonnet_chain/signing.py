@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import time
 import unicodedata
@@ -14,6 +15,7 @@ from .secure_files import read_private_file
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MULTICODEC_ED25519 = b"\xed\x01"
 INVISIBLE = {"Cc", "Cf", "Cs", "Co", "Zl", "Zp"}
+PUBLIC_KEY_CACHE_SIZE = 256
 
 
 def _b58(raw: bytes) -> str:
@@ -43,6 +45,7 @@ def did_of(key: Ed25519PrivateKey) -> str:
     return "did:key:z" + _b58(MULTICODEC_ED25519 + pub)
 
 
+@functools.lru_cache(maxsize=PUBLIC_KEY_CACHE_SIZE)
 def public_key_of_did(did: str) -> Ed25519PublicKey:
     prefix = "did:key:z"
     if not did.startswith(prefix):
