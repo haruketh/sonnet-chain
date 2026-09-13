@@ -1,3 +1,22 @@
+# Participant Design v0
+
+**Status:** Historical / Superseded  
+**Archived:** 2026-09-13
+
+This document preserves the initial Sonnet participant architecture created before the runtime was decomposed into STEP-specific designs.
+
+It is retained as historical design context and rationale. It is **not the normative specification for the current Saruku Sonnet participant runtime**.
+
+The participant architecture was subsequently redesigned around explicit protocol safety, liveness, qualification safety, completion under unreliable multi-agent behavior, and STEP-specific responsibility boundaries.
+
+Current normative behavior is defined by the applicable STEP-specific design documents.
+
+Where this document conflicts with an approved STEP-specific design, the STEP-specific design takes precedence.
+
+Do not update this archive to match current implementation. Historical differences are intentional.
+
+---
+
 # Sonnet Chain Participant Design v0.1
 
 > STEP1 Team Formation is normatively defined by
