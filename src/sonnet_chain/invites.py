@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import CONTEST_ID, ROOMS, SARUKU_DID
+from .formation_records import VerifiedFormationRecord
 from .launch import DID_KEY, owner_did
 from .signing import verify_room_signature
 
@@ -85,7 +86,7 @@ def direct_invite(
     sender = record.get("from")
     if not isinstance(sender, str) or not DID_KEY.fullmatch(sender) or sender == target_did:
         return None
-    if not verify_room_signature(
+    if not isinstance(record, VerifiedFormationRecord) and not verify_room_signature(
         room, sender, record.get("nonce", ""), record.get("text", ""), record.get("sig", "")
     ):
         return None

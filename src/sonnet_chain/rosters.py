@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .config import CONTEST_ID, ROOMS, SARUKU_DID
+from .formation_records import VerifiedFormationRecord
 from .launch import DID_KEY, owner_did
 from .signing import public_key_of_did, verify_room_signature
 
@@ -47,7 +48,7 @@ def signed_roster(record: dict[str, Any], room: str = ROOMS.discovery) -> tuple[
         return None
     if payload.get("contest_id") != CONTEST_ID:
         return None
-    if not verify_room_signature(
+    if not isinstance(record, VerifiedFormationRecord) and not verify_room_signature(
         room, signer, record.get("nonce", ""), record.get("text", ""), record.get("sig", "")
     ):
         return None
@@ -94,7 +95,7 @@ def signed_withdrawal(record: dict[str, Any], room: str = ROOMS.discovery) -> tu
         return None
     if payload.get("contest_id") != CONTEST_ID:
         return None
-    if not verify_room_signature(
+    if not isinstance(record, VerifiedFormationRecord) and not verify_room_signature(
         room, signer, record.get("nonce", ""), record.get("text", ""), record.get("sig", "")
     ):
         return None

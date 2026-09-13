@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .config import ROOMS
+from .formation_records import VerifiedFormationRecord
 
 
 class Phase(StrEnum):
@@ -111,6 +112,23 @@ class StateStore:
               inviter_did TEXT NOT NULL, source_seq INTEGER NOT NULL,
               payload_json TEXT NOT NULL,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS formation_events (
+              room TEXT NOT NULL, generation INTEGER NOT NULL, seq INTEGER NOT NULL,
+              event_kind TEXT NOT NULL, game_id TEXT, sender_did TEXT NOT NULL,
+              request_id TEXT, roster_fingerprint TEXT,
+              normalized_payload TEXT NOT NULL, observed_at TEXT,
+              verified INTEGER NOT NULL CHECK(verified=1),
+              PRIMARY KEY(room,generation,seq)
+            );
+            CREATE INDEX IF NOT EXISTS formation_events_game
+              ON formation_events(room,generation,game_id,seq);
+            CREATE INDEX IF NOT EXISTS formation_events_request
+              ON formation_events(room,generation,request_id);
+            CREATE TABLE IF NOT EXISTS formation_event_processing (
+              room TEXT NOT NULL, generation INTEGER NOT NULL, seq INTEGER NOT NULL,
+              processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(room,generation,seq)
             );
             CREATE TABLE IF NOT EXISTS protocol_outbox (
               request_id TEXT PRIMARY KEY, action_kind TEXT NOT NULL,
@@ -254,6 +272,71 @@ class StateStore:
             "SELECT payload FROM events WHERE room=? ORDER BY generation,seq", (room,)
         ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def unprocessed_formation_events(self, room: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT e.generation,e.seq,e.payload FROM events e LEFT JOIN "
+            "formation_event_processing p ON p.room=e.room AND p.generation=e.generation "
+            "AND p.seq=e.seq WHERE e.room=? AND p.seq IS NULL ORDER BY e.generation,e.seq",
+            (room,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            raw = json.loads(row["payload"])
+            raw["_formation_generation"] = row["generation"]
+            raw["_formation_seq"] = row["seq"]
+            out.append(raw)
+        return out
+
+    def mark_formation_event_processed(self, room: str, generation: int, seq: int) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO formation_event_processing(room,generation,seq) VALUES(?,?,?)",
+                (room, generation, seq),
+            )
+
+    def persist_formation_event(
+        self, room: str, generation: int, seq: int, event_kind: str,
+        game_id: str | None, sender_did: str, request_id: str | None,
+        roster_fingerprint: str | None, raw: dict[str, Any], observed_at: str | None,
+    ) -> None:
+        stored = dict(raw)
+        stored.pop("_formation_verified", None)
+        stored["_room_generation"] = None if generation == -1 else generation
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO formation_events(room,generation,seq,event_kind,game_id,"
+                "sender_did,request_id,roster_fingerprint,normalized_payload,observed_at,verified) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+                (room, generation, seq, event_kind, game_id, sender_did, request_id,
+                 roster_fingerprint, json.dumps(stored, ensure_ascii=False, separators=(",", ":")),
+                 observed_at),
+            )
+            self.db.execute(
+                "INSERT OR IGNORE INTO formation_event_processing(room,generation,seq) VALUES(?,?,?)",
+                (room, generation, seq),
+            )
+
+    def formation_events(
+        self, room: str, generation: int | None = None, *, game_id: str | None = None,
+        request_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["room=?", "verified=1"]
+        args: list[Any] = [room]
+        if generation is not None:
+            clauses.append("generation=?")
+            args.append(generation)
+        if game_id is not None:
+            clauses.append("game_id=?")
+            args.append(game_id)
+        if request_id is not None:
+            clauses.append("request_id=?")
+            args.append(request_id)
+        rows = self.db.execute(
+            "SELECT normalized_payload FROM formation_events WHERE " + " AND ".join(clauses)
+            + " ORDER BY generation,seq", args,
+        ).fetchall()
+        return [VerifiedFormationRecord(json.loads(row["normalized_payload"])) for row in rows]
 
     def reserve_request(self, request_id: str, kind: str, payload: dict) -> bool:
         with self.db:

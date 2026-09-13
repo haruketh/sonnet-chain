@@ -11,6 +11,7 @@ import httpx
 
 from .cli import emit_or_post, signer_from
 from .config import CONTEST_ID, Config, ROOMS, SARUKU_DID
+from .formation_records import VerifiedFormationRecord
 from .decision import (
     Action, build_decision_state, coordination_key, coordination_text, decide,
     validate_decision,
@@ -191,6 +192,67 @@ class Daemon:
     def _trusted_writer_dids(self) -> set[str]:
         return self.state.trusted_writer_dids()
 
+    def _sync_formation_events(self) -> None:
+        """Verify each relevant Discovery record once, then use durable facts."""
+        trusted = self._trusted_writer_dids()
+        for raw in self.state.unprocessed_formation_events(ROOMS.discovery):
+            generation = int(raw.pop("_formation_generation"))
+            seq = int(raw.pop("_formation_seq"))
+            sender = raw.get("from")
+            text_value = raw.get("text")
+            try:
+                payload = json.loads(text_value) if isinstance(text_value, str) else None
+            except json.JSONDecodeError:
+                payload = None
+            if not isinstance(sender, str) or not isinstance(payload, dict):
+                self.state.mark_formation_event_processed(ROOMS.discovery, generation, seq)
+                continue
+            kind = payload.get("type")
+            normalized_kind = None
+            game_id = payload.get("game_id") if isinstance(payload.get("game_id"), str) else None
+            fingerprint = None
+            # Structural routing ensures an event reaches at most one Ed25519 check.
+            if kind == "sonnet.roster.v1":
+                parsed = signed_roster(raw)
+                if parsed is not None:
+                    normalized_kind = "ROSTER_CONSENT"
+                    game_id = parsed[0].game_id
+                    fingerprint = roster_fingerprint(parsed[0])
+            elif kind == "sonnet.withdraw.v1":
+                parsed_withdrawal = signed_withdrawal(raw)
+                if parsed_withdrawal is not None:
+                    normalized_kind = "ROSTER_WITHDRAWAL"
+                    game_id = parsed_withdrawal[0]
+            elif kind == "sonnet.note.v1":
+                if targeted_recruitment_note(raw, trusted) is not None:
+                    normalized_kind = "TARGETED_RECRUITMENT_NOTE"
+            elif (
+                kind == "sonnet.application.v1" and sender == SARUKU_DID
+                and payload.get("contest_id") == CONTEST_ID and game_id is not None
+                and verify_room_signature(
+                    ROOMS.discovery, sender, raw.get("nonce", ""),
+                    text_value, raw.get("sig", ""),
+                )
+            ):
+                normalized_kind = "APPLICATION_READBACK"
+            if normalized_kind is None:
+                self.state.mark_formation_event_processed(ROOMS.discovery, generation, seq)
+                continue
+            stamp = record_time(raw)
+            self.state.persist_formation_event(
+                ROOMS.discovery, generation, seq, normalized_kind, game_id, sender,
+                payload.get("request_id") if isinstance(payload.get("request_id"), str) else None,
+                fingerprint, raw, stamp.isoformat() if stamp is not None else None,
+            )
+
+    def _formation_records(
+        self, generation: int | None = None, *, game_id: str | None = None,
+        request_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.state.formation_events(
+            ROOMS.discovery, generation, game_id=game_id, request_id=request_id,
+        )
+
     def _formation_invite_blocked(self, invite: Any) -> bool:
         rows = self.state.db.execute(
             "SELECT payload_json,active FROM formation_epochs WHERE game_id=?",
@@ -210,10 +272,9 @@ class Daemon:
         epoch = formation.active_epoch()
         if epoch is None:
             return
-        records = self.state.events(ROOMS.discovery)
         withdraw_intent = self.state.unresolved_protocol_intent("withdraw")
         if withdraw_intent is not None and epoch.withdraw_pending:
-            for raw in records:
+            for raw in self._formation_records(request_id=withdraw_intent["request_id"]):
                 if signed_withdrawal(raw) != (epoch.game_id, SARUKU_DID):
                     continue
                 try:
@@ -239,11 +300,12 @@ class Daemon:
                 )
                 return
         found: dict[str, Any] | None = None
-        for raw in records:
-            if raw.get("from") != SARUKU_DID or not verify_room_signature(
+        for raw in self._formation_records(request_id=epoch.application_request_id):
+            if raw.get("from") != SARUKU_DID or (
+                not isinstance(raw, VerifiedFormationRecord) and not verify_room_signature(
                 ROOMS.discovery, SARUKU_DID, raw.get("nonce", ""),
                 raw.get("text", ""), raw.get("sig", ""),
-            ):
+            )):
                 continue
             try:
                 payload = json.loads(raw["text"])
@@ -313,7 +375,7 @@ class Daemon:
             return
         opportunities = []
         trusted = self._trusted_writer_dids()
-        for raw in self.state.events(ROOMS.discovery):
+        for raw in self._formation_records(game_id=game_id):
             opportunity = targeted_recruitment_note(raw, trusted)
             if opportunity is not None and opportunity.game_id == game_id:
                 opportunities.append(opportunity)
@@ -743,6 +805,7 @@ class Daemon:
         # Trusted referee terminal facts are processed before every local
         # formation heuristic.
         self._receipts(ROOMS.discovery)
+        self._sync_formation_events()
         if self.state.phase != Phase.DISCOVERY:
             return
         # Recruitment authority comes from referee-accepted registration
@@ -768,10 +831,7 @@ class Daemon:
         if self.state.active_team() is None and self.cfg.x_account_url:
             journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
             _, discovery_generation = self.state.cursor(ROOMS.discovery)
-            discovery_events = [
-                event for event in self.state.events(ROOMS.discovery)
-                if event.get("_room_generation") == discovery_generation
-            ]
+            discovery_events = self._formation_records(discovery_generation)
             parsed_rosters = [
                 (item, parsed)
                 for item in discovery_events
@@ -1191,10 +1251,7 @@ class Daemon:
         if not isinstance(referee, str):
             return
         _, discovery_generation = self.state.cursor(ROOMS.discovery)
-        discovery_events = [
-            event for event in self.state.events(ROOMS.discovery)
-            if event.get("_room_generation") == discovery_generation
-        ]
+        discovery_events = self._formation_records(discovery_generation)
         journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
         pending_game = pending_application(journal_path)
         active_epoch = TeamFormationStore(self.state).active_epoch()
@@ -1356,9 +1413,10 @@ class Daemon:
         self.state.set("roster_wait_soft_timeout_noted", False)
 
     def _wait_roster_ready(self) -> None:
-        self._bootstrap_formation_state()
         # Referee resolution wins every race. Process receipts first.
         self._receipts(ROOMS.discovery)
+        self._sync_formation_events()
+        self._bootstrap_formation_state()
         if self.state.phase != Phase.WAIT_ROSTER_READY:
             return
 
@@ -1398,15 +1456,13 @@ class Daemon:
         )
 
         _, discovery_generation = self.state.cursor(ROOMS.discovery)
-        discovery_events = [
-            event
-            for event in self.state.events(ROOMS.discovery)
-            if event.get("_room_generation") == discovery_generation
-        ]
+        discovery_events = self._formation_records(discovery_generation)
         withdraw_intent = self.state.unresolved_protocol_intent("withdraw")
         if withdraw_intent is not None and withdraw_intent.get("game_id") == game_id:
             reconciled = False
-            for raw in discovery_events:
+            for raw in self._formation_records(
+                discovery_generation, request_id=withdraw_intent["request_id"]
+            ):
                 parsed_withdrawal = signed_withdrawal(raw)
                 if parsed_withdrawal != (game_id, SARUKU_DID):
                     continue
@@ -1448,7 +1504,9 @@ class Daemon:
             ConsentDelivery.CONSENT_DELIVERY_UNKNOWN,
         }:
             confirmed = False
-            for raw in discovery_events:
+            for raw in self._formation_records(
+                discovery_generation, request_id=str(pending.get("request_id", ""))
+            ):
                 parsed = signed_roster(raw)
                 if parsed != (target, SARUKU_DID):
                     continue

@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Any, Iterable
 
 from .config import CONTEST_ID, ROOMS, SARUKU_DID
+from .formation_records import VerifiedFormationRecord
 from .launch import DID_KEY
 from .rosters import CanonicalRoster, signed_roster, signed_withdrawal
 from .signing import verify_room_signature
@@ -174,9 +175,10 @@ def targeted_recruitment_note(
         not isinstance(generation, int) or isinstance(generation, bool) or generation < 0
     ):
         return None
-    if not DID_KEY.fullmatch(sender) or not verify_room_signature(
+    if not DID_KEY.fullmatch(sender) or (
+        not isinstance(record, VerifiedFormationRecord) and not verify_room_signature(
         room, sender, record.get("nonce", ""), text, record.get("sig", "")
-    ):
+    )):
         return None
     stamp = record.get("created_at", record.get("timestamp", record.get("ts")))
     observed_at = None
