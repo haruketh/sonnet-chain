@@ -233,7 +233,7 @@ def _writing_state(
         "SELECT room,generation,seq,kind,payload FROM receipts WHERE room=? AND generation=? "
         "AND accepted=1 ORDER BY seq DESC LIMIT 200) r "
         "JOIN events e ON e.room=r.room AND e.generation=r.generation AND e.seq=r.seq "
-        "WHERE r.kind='word_accepted' ORDER BY r.seq DESC LIMIT 80",
+        "WHERE r.kind='word_accepted' ORDER BY r.seq DESC LIMIT 81",
         (room, generation),
     ).fetchall()
     accepted: list[tuple[int, str, dict[str, Any], str]] = []
@@ -274,6 +274,13 @@ def _writing_state(
 
     accepted.sort(key=lambda item: item[0])
     prior_lines = 0
+    if len(accepted) > 80:
+        _, _, baseline, _ = accepted.pop(0)
+        baseline_lines = baseline.get("lines")
+        if isinstance(baseline_lines, list) and all(
+            isinstance(line, str) for line in baseline_lines
+        ):
+            prior_lines = len(baseline_lines)
     for seq, at, payload, _ in accepted:
         contributor = aliases.get(payload.get("contributor_did"))
         word = payload.get("word")
@@ -343,7 +350,10 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
                 "SELECT seq,event_kind,game_id,sender_did,normalized_payload,observed_at "
                 "FROM formation_events WHERE room=? AND generation=? AND verified=1 "
                 "AND julianday(observed_at)>=julianday(?) AND event_kind='ROSTER_CONSENT' "
-                "ORDER BY seq DESC LIMIT 160", common,
+                "AND EXISTS (SELECT 1 FROM json_each(json_extract(json_extract("
+                "formation_events.normalized_payload,'$.text'),'$.members')) member "
+                "WHERE member.value=?) ORDER BY seq DESC LIMIT 160",
+                (*common, SARUKU_DID),
             ).fetchall())
         roster_seen: set[str] = set()
         for row in [*invitation_rows, *application_rows, *roster_rows]:

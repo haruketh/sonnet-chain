@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -233,6 +233,44 @@ def test_160_unrelated_rosters_cannot_hide_two_applications(tmp_path):
     assert len([item for item in document["recent_activity"] if item["type"] == "applied"]) == 2
 
 
+def test_160_unrelated_rosters_cannot_hide_saruku_roster_or_countersign(tmp_path):
+    state = _state(tmp_path)
+    members = [SARUKU_DID, "did:key:zTeammate"]
+    _formation(state, 101, "ROSTER_CONSENT", {"members": members},
+               sender="did:key:zTeammate", game="ours")
+    unrelated = ["did:key:zOne", "did:key:zTwo"]
+    for seq in range(102, 273):
+        _formation(state, seq, "ROSTER_CONSENT", {"members": unrelated}, game=f"noise-{seq}")
+    _formation(state, 273, "ROSTER_CONSENT", {"members": members},
+               sender=SARUKU_DID, game="ours")
+    document = build_public_document(state.path, NOW)
+    assert document["counts"]["rosters_with_saruku"] == 1
+    assert document["counts"]["countersigns"] == 1
+    assert {item["type"] for item in document["recent_activity"]} == {
+        "roster", "countersigned",
+    }
+
+
+def test_accepted_word_tail_uses_81st_receipt_only_as_line_baseline(tmp_path):
+    state = _state(tmp_path); _writing_state(state)
+    base = datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc)
+    for seq in range(1, 86):
+        lines = ["Line one", "Line two", "Line three"]
+        if seq == 85:
+            lines.append("Line four")
+        _receipt(
+            state, seq, "word_accepted",
+            {"game_id": "g", "version": seq, "contributor_did": "did:key:zAlpha",
+             "word": f"word{seq}", "lines": lines},
+            observed=(base + timedelta(seconds=seq)).isoformat(),
+        )
+    activity = build_public_document(state.path, NOW)["writing"]["activity"]
+    completed = [item["detail"] for item in activity if item["type"] == "line_completed"]
+    assert completed == ["Line 4 was completed."]
+    assert all("Line 1 " not in item and "Line 2 " not in item and "Line 3 " not in item
+               for item in completed)
+
+
 def test_public_schema_has_no_private_structural_fields(tmp_path):
     state = _state(tmp_path); _writing_state(state)
     _team_source(state, 1, SARUKU_DID, {"type": "sonnet.note.v1", "contest_id": "sonnet-2", "text": "Public speech"})
@@ -286,6 +324,14 @@ def test_synthetic_v2_export_is_bounded_and_indexed(tmp_path):
         (ROOMS.discovery, 2, "APPLICATION_READBACK"),
     ).fetchall()
     assert any("formation_events_kind_seq" in str(row) for row in plan)
+    roster_plan = readonly.execute(
+        "EXPLAIN QUERY PLAN SELECT seq FROM formation_events WHERE room=? AND generation=? "
+        "AND verified=1 AND event_kind='ROSTER_CONSENT' AND EXISTS (SELECT 1 FROM "
+        "json_each(json_extract(json_extract(formation_events.normalized_payload,'$.text'),"
+        "'$.members')) member WHERE member.value=?) ORDER BY seq DESC LIMIT 160",
+        (ROOMS.discovery, 2, SARUKU_DID),
+    ).fetchall()
+    assert any("formation_events_kind_seq" in str(row) for row in roster_plan)
     print({"runs": len(elapsed), "max_ms": round(max(elapsed) * 1000, 3),
            "writing_activity": len(document["writing"]["activity"]),
            "unrelated_rosters": 171})
