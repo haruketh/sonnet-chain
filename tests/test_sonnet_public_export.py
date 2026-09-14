@@ -80,6 +80,7 @@ def test_mixed_sqlite_and_iso_timestamps_are_compared_chronologically(tmp_path):
     state.reserve_request("private", "application:g", {"game_id": "g"})
     state.db.execute("UPDATE requests SET created_at='2026-09-14 11:00:00'")
     _formation(state, 102, "TARGETED_RECRUITMENT_NOTE", {}, observed="2026-09-14T11:05:00+00:00")
+    _formation(state, 103, "APPLICATION_READBACK", {}, observed="2026-09-14 11:10:00")
     document = build_public_document(state.path, NOW)
     assert document["counts"]["reflex_replies"] == 1
     assert document["counts"]["applications"] == 1
@@ -90,6 +91,7 @@ def test_application_roster_countersign_and_terminal_states(tmp_path):
     state = _state(tmp_path)
     state.reserve_request("secret-request", "application:g", {"game_id": "g"})
     state.db.execute("UPDATE requests SET created_at='2026-09-14T11:00:00Z'")
+    _formation(state, 101, "APPLICATION_READBACK", {})
     members = [SARUKU_DID, "did:key:zOther"]
     _formation(state, 102, "ROSTER_CONSENT", {"members": members}, sender="did:key:zOther")
     _formation(state, 103, "ROSTER_CONSENT", {"members": members}, sender=SARUKU_DID)
@@ -111,6 +113,32 @@ def test_application_roster_countersign_and_terminal_states(tmp_path):
         if phase == Phase.DONE: state.set("submission_state", "accepted")
         current = build_public_document(state.path, NOW)
         assert (current["mission"]["status"], current["mission"]["current_stage"]) == (status, stage)
+
+
+@pytest.mark.parametrize("request_status", ["pending", "delivery_unknown", "expired", "rejected"])
+def test_local_application_request_without_verified_readback_is_not_public(tmp_path, request_status):
+    state = _state(tmp_path)
+    state.reserve_request("private-request", "application:g", {"game_id": "g"})
+    state.db.execute(
+        "UPDATE requests SET status=?,created_at='2026-09-14 11:00:00' WHERE request_id='private-request'",
+        (request_status,),
+    )
+    document = build_public_document(state.path, NOW)
+    assert document["counts"]["applications"] == 0
+    assert not any(item["type"] == "applied" for item in document["recent_activity"])
+
+
+def test_verified_application_readback_is_exactly_one_public_applied_event(tmp_path):
+    state = _state(tmp_path)
+    state.reserve_request("private-request", "application:g", {"game_id": "g"})
+    _formation(state, 101, "APPLICATION_READBACK", {}, observed="2026-09-14T11:00:00+00:00")
+    document = build_public_document(state.path, NOW)
+    applied = [item for item in document["recent_activity"] if item["type"] == "applied"]
+    assert document["counts"]["applications"] == 1
+    assert len(applied) == 1
+    assert applied[0]["title"] == "Applied"
+    assert applied[0]["detail"] == "Saruku's application was confirmed in Discovery."
+    assert applied[0]["at"] == "2026-09-14T11:00:00Z"
 
 
 def test_export_is_stable_except_checked_at_and_invalid_does_not_replace(tmp_path):

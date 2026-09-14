@@ -143,8 +143,9 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
                 activities.append(_activity("team_invitation", at, "Team invitation",
                     "Saruku received a direct team invitation.", ("invite", row["seq"]), game_id))
             elif kind == "APPLICATION_READBACK":
-                activities.append(_activity("application_confirmed", at, "Application confirmed",
-                    "Saruku’s application was confirmed.", ("application-readback", row["seq"]), game_id))
+                activities.append(_activity("applied", at, "Applied",
+                    "Saruku's application was confirmed in Discovery.",
+                    ("application-readback", row["seq"]), game_id))
             else:
                 try:
                     raw = json.loads(row["normalized_payload"]); payload = json.loads(raw["text"])
@@ -185,19 +186,6 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
             elif row["status"] == "NO_REPLY":
                 activities.append(_activity("no_reply", at, "No reply",
                     "No response was needed.", identity + ("no-reply",), row["game_id"]))
-
-        requests = db.execute(
-            "SELECT kind,status,created_at FROM requests WHERE kind LIKE 'application:%' "
-            "AND julianday(created_at)>=julianday(?) ORDER BY created_at DESC LIMIT 80",
-            (tracking_started,),
-        ).fetchall()
-        for row in requests:
-            at = _timestamp(row["created_at"])
-            if at is None:
-                continue
-            game_id = row["kind"].split(":", 1)[1]
-            activities.append(_activity("applied", at, "Applied",
-                "Saruku applied to join the team.", ("application", game_id, at), game_id))
 
         # Only timestamped durable facts belong in the timeline. Current phase
         # remains visible in the hero even when no authoritative transition
@@ -246,9 +234,9 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
             "AND event_kind='TARGETED_RECRUITMENT_NOTE'", (ROOMS.discovery, tracking_started),
         ).fetchone()[0]
         applications = db.execute(
-            "SELECT count(*) FROM requests WHERE kind LIKE 'application:%' "
-            "AND julianday(created_at)>=julianday(?)",
-            (tracking_started,),
+            "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 "
+            "AND julianday(observed_at)>=julianday(?) AND event_kind='APPLICATION_READBACK'",
+            (ROOMS.discovery, tracking_started),
         ).fetchone()[0]
         countersigns = db.execute(
             "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 "
