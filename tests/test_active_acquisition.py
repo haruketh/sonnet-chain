@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -17,6 +18,7 @@ from sonnet_chain.team_formation import (
     TeamFormationStore, start_epoch,
 )
 from test_invites import _daemon, _signed, _invite
+from test_formation_reflex import FakeLLM
 
 
 @pytest.fixture
@@ -74,6 +76,55 @@ def test_exact_current_four_member_withdrawal(scene):
     assert opportunity.inviter_did == scene[2].members[0]
     assert opportunity.source_seq == 3
     assert opportunity.observed_at == scene[3]
+
+
+@pytest.mark.parametrize("kind,active,expected_calls", [
+    ("ACTIVE_VACANCY", False, 0),
+    ("TARGETED_INVITE", False, 1),
+    ("ACTIVE_VACANCY", True, 1),
+])
+def test_team_reflex_requires_invitation_or_active_epoch(scene, monkeypatch, kind, active, expected_calls):
+    from sonnet_chain import daemon as module
+    daemon, _, roster, now = scene
+    daemon.cfg = replace(daemon.cfg, openai_api_key_file=daemon.cfg.state_db.parent / "unused-key")
+    # Isolate pre-application Reflex from the subsequent acquisition policy.
+    daemon.state.set("registered", False)
+    daemon.state.reset_cursor(ROOMS.discovery, 1)
+    opportunity = FormationOpportunity(
+        roster.game_id, roster.members[0], 1, now, roster.poem_room, 3,
+        opportunity_kind=kind, source_generation=1,
+    )
+    formation = TeamFormationStore(daemon.state)
+    formation.save_opportunity(opportunity)
+    if kind == "TARGETED_INVITE" and not active:
+        # A newer vacancy must not hide a genuine invitation further down
+        # the existing descending-sequence opportunity list.
+        formation.save_opportunity(FormationOpportunity(
+            "unapplied", roster.members[0], 2, now, ROOMS.team("unapplied"), 3,
+            opportunity_kind="ACTIVE_VACANCY", source_generation=1,
+        ))
+    if active:
+        formation.save_epoch(start_epoch(opportunity, "existing", now))
+    with daemon.state.db:
+        daemon.state.db.execute(
+            "INSERT INTO formation_reflex_frontiers(source_room,source_generation,last_seq) VALUES(?,?,0)",
+            (roster.poem_room, 3),
+        )
+    raw = {"seq": 1, "from": roster.members[0], "text": "Saruku, are you available?"}
+    daemon.state.persist_team_source(roster.poem_room, 3, 1, raw["from"], raw, None, None, "semantic")
+    llm = FakeLLM()
+    monkeypatch.setattr(module, "LLMClient", lambda *args, **kwargs: llm)
+    syncs, opens, posts = [], [], []
+    monkeypatch.setattr(module.TeamIntelligence, "sync_sources", lambda *args: syncs.append(args))
+    daemon._team_room_open = lambda *args: opens.append(args) or True
+    daemon._post = lambda room, payload: posts.append((room, payload))
+    daemon._discovery()
+    assert len(llm.calls) == len(syncs) == len(opens) == len(posts) == expected_calls
+    if expected_calls:
+        assert posts[0][0] == roster.poem_room
+        assert posts[0][1]["type"] == "sonnet.note.v1"
+    else:
+        assert formation.active_epoch() is None
 
 
 @pytest.mark.parametrize("case", ["historical", "withdrawn", "five", "nonmember", "no_survivor", "saruku"])

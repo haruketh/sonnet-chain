@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from .active_acquisition import ActiveAcquisition
+from .active_acquisition import ActiveAcquisition, ACTIVE_SEARCH_FRESHNESS
 from .cli import emit_or_post, signer_from
 from .config import CONTEST_ID, Config, ROOMS, SARUKU_DID
 from .formation_reflex import FormationReflexResponder
@@ -935,8 +935,10 @@ class Daemon:
                 if active_for_reflex is not None else None
             )
             if opportunity is None and active_for_reflex is None:
-                relevant = formation.opportunities()
-                opportunity = relevant[0] if relevant else None
+                opportunity = next((
+                    item for item in formation.opportunities()
+                    if item.opportunity_kind == "TARGETED_INVITE"
+                ), None)
             referee = self.state.get("referee_did")
             if (
                 opportunity is not None and opportunity.poem_room is not None
@@ -1077,6 +1079,15 @@ class Daemon:
                     )
                     acquisition.scan(now)
                 for opportunity in formation_store.opportunities():
+                    # Reject unavailable/expired vacancy evidence before room
+                    # I/O or per-game reconstruction. Targeted notes retain
+                    # their separate existing freshness/structure semantics.
+                    if opportunity.opportunity_kind == "ACTIVE_VACANCY" and (
+                        opportunity.observed_at is None
+                        or opportunity.observed_at.tzinfo is None
+                        or not timedelta(0) <= now - opportunity.observed_at <= ACTIVE_SEARCH_FRESHNESS
+                    ):
+                        continue
                     if not formation_store.opportunity_is_fresh_after_terminal(opportunity):
                         continue
                     invite = DirectInvite(
