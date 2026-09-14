@@ -27,6 +27,11 @@ class FakeLLM:
 def _store(tmp_path):
     state = StateStore(tmp_path / "state.db")
     state.phase = Phase.DISCOVERY
+    with state.db:
+        state.db.execute(
+            "INSERT INTO formation_reflex_frontiers(source_room,source_generation,last_seq) "
+            "VALUES(?,?,0)", (ROOMS.discovery, 2),
+        )
     return state
 
 
@@ -77,6 +82,31 @@ def test_roster_requires_saruku_and_self_is_ignored(tmp_path):
     assert llm.calls == []
 
 
+def test_irrelevant_roster_does_not_starve_later_targeted_invite(tmp_path):
+    state = _store(tmp_path)
+    _formation_event(state, seq=10, kind="ROSTER_CONSENT", members=["did:key:zOther"])
+    _formation_event(state, seq=11)
+    llm = FakeLLM()
+    result = _responder(state, llm, []).run_once(2)
+    assert result.processed and len(llm.calls) == 1
+    assert state.db.execute(
+        "SELECT last_seq FROM formation_reflex_frontiers WHERE source_room=? AND source_generation=2",
+        (ROOMS.discovery,),
+    ).fetchone()["last_seq"] == 11
+
+
+def test_first_activation_baselines_history_then_accepts_new_event(tmp_path):
+    state = _store(tmp_path)
+    state.db.execute("DELETE FROM formation_reflex_frontiers")
+    _formation_event(state, seq=10)
+    llm = FakeLLM()
+    assert not _responder(state, llm, []).run_once(2).processed
+    assert llm.calls == []
+    _formation_event(state, seq=11)
+    assert _responder(state, llm, []).run_once(2).processed
+    assert len(llm.calls) == 1
+
+
 def test_llm_failure_uses_safe_note_fallback_without_protocol_transition(tmp_path):
     state = _store(tmp_path); _formation_event(state)
     result = _responder(state, FakeLLM(error=RuntimeError("offline")), []).run_once(2)
@@ -86,6 +116,11 @@ def test_llm_failure_uses_safe_note_fallback_without_protocol_transition(tmp_pat
 
 def test_team_room_direct_alias_is_incremental_and_unrelated_is_ignored(tmp_path):
     state = _store(tmp_path); room = ROOMS.team("g")
+    with state.db:
+        state.db.execute(
+            "INSERT INTO formation_reflex_frontiers(source_room,source_generation,last_seq) "
+            "VALUES(?,?,0)", (room, 7),
+        )
     unrelated = {"seq": 1, "from": "did:key:zWriter", "text": "hello"}
     direct = {"seq": 2, "from": "did:key:zWriter", "text": "@Saruku, are you available?"}
     state.persist_team_source(room, 7, 1, unrelated["from"], unrelated, None, None, "semantic")
@@ -94,6 +129,35 @@ def test_team_room_direct_alias_is_incremental_and_unrelated_is_ignored(tmp_path
     assert result.payload is not None and len(llm.calls) == 1
     assert result.payload["target_did"] == direct["from"]
     assert not _responder(state, FakeLLM(), []).run_once(7, team_game_id="g", team_room=room).processed
+
+
+def test_capability_facts_are_system_controlled_llm_input(tmp_path):
+    state = _store(tmp_path); _formation_event(state)
+    llm = FakeLLM({"action": "reply", "text": "I can help with syllables and turn coordination.",
+                   "reason_code": "capability_question"})
+    result = _responder(state, llm, []).run_once(2)
+    capabilities = llm.calls[0][1]["capabilities"]["authoritative_text"]
+    assert "coordinate turns" in capabilities and "syllables" in capabilities
+    assert "DID-letter constraints" in capabilities and "registered X account" in capabilities
+    assert result.payload["text"] == "I can help with syllables and turn coordination."
+
+
+def test_team_room_50k_history_is_baselined_and_only_new_direct_is_parsed(tmp_path):
+    state = _store(tmp_path); room = ROOMS.team("g"); raw = json.dumps(
+        {"seq": 1, "from": "did:key:zWriter", "text": "ordinary chatter"}
+    )
+    with state.db:
+        state.db.executemany(
+            "INSERT INTO team_source_events(room,generation,seq,sender_did,payload,verified) "
+            "VALUES(?,?,?,?,?,1)",
+            [(room, 7, seq, "did:key:zWriter", raw) for seq in range(1, 50001)],
+        )
+    llm = FakeLLM(); responder = _responder(state, llm, [])
+    assert not responder.run_once(7, team_game_id="g", team_room=room).processed
+    direct = {"seq": 50001, "from": "did:key:zWriter", "text": "Saruku, can you help?"}
+    state.persist_team_source(room, 7, 50001, direct["from"], direct, None, None, "semantic")
+    assert responder.run_once(7, team_game_id="g", team_room=room).processed
+    assert len(llm.calls) == 1
 
 
 def test_writing_disables_reflex(tmp_path):
@@ -117,6 +181,15 @@ def test_consumed_and_terminal_stale_opportunities_are_durable(tmp_path):
     assert store.opportunity_is_fresh_after_terminal(fresh)
     state.close(); reopened = StateStore(tmp_path / "state.db")
     assert [x.source_seq for x in TeamFormationStore(reopened).opportunities()] == [20]
+
+
+def test_lead_verified_survives_durable_opportunity_round_trip(tmp_path):
+    state = _store(tmp_path); store = TeamFormationStore(state)
+    store.save_opportunity(FormationOpportunity(
+        "lead-game", "did:key:zLead", 9, datetime.now(timezone.utc),
+        lead_verified=True,
+    ))
+    assert store.opportunities(game_id="lead-game")[0].lead_verified is True
 
 
 def test_scoped_formation_query_does_not_decode_unrelated_history(tmp_path):

@@ -133,6 +133,16 @@ def test_recruitment_allowlist_and_trusted_role():
     assert targeted_recruitment_note(signed(key, {"type": "sonnet.invite.v2", **base}, 3), {did}) is None
 
 
+def test_recruitment_preserves_verified_lead_signal():
+    key = Ed25519PrivateKey.generate(); did = did_of(key)
+    note = signed(key, {
+        "type": "sonnet.note.v1", "contest_id": CONTEST_ID, "game_id": "g",
+        "target_did": SARUKU_DID, "team_lead_did": did,
+    }, 1)
+    opportunity = targeted_recruitment_note(note, {did})
+    assert opportunity is not None and opportunity.lead_verified is True
+
+
 def test_tampered_recruitment_is_ignored():
     key = Ed25519PrivateKey.generate(); did = did_of(key)
     item = signed(key, {"type": "sonnet.note.v1", "contest_id": CONTEST_ID,

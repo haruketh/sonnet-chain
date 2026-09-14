@@ -150,6 +150,7 @@ class FormationOpportunity:
     observed_at: datetime | None
     poem_room: str | None = None
     room_generation: int | None = None
+    lead_verified: bool = False
 
 
 def targeted_recruitment_note(
@@ -200,9 +201,10 @@ def targeted_recruitment_note(
             observed_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
         except ValueError:
             pass
+    lead = payload.get("team_lead_did", payload.get("lead_did"))
     return FormationOpportunity(
         game_id, sender, int(record.get("seq", 0) or 0), observed_at,
-        poem_room, generation,
+        poem_room, generation, isinstance(lead, str) and lead == sender,
     )
 
 

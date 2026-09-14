@@ -1073,7 +1073,8 @@ class Daemon:
                         continue
                     invite = DirectInvite(
                         opportunity.game_id, opportunity.inviter_did,
-                        opportunity.poem_room, opportunity.room_generation, 1, False,
+                        opportunity.poem_room, opportunity.room_generation, 1,
+                        opportunity.lead_verified,
                         opportunity.observed_at.timestamp() if opportunity.observed_at else float("-inf"),
                         opportunity.source_seq,
                     )

@@ -12,6 +12,7 @@ from .llm import LLMClient, LLMUnavailable
 from .protocol import request_id
 from .state import Phase, StateStore
 from .team_formation import TeamFormationStore
+from .team_intelligence import CAPABILITY_TEXT
 
 REFLEX_SCHEMA = {
     "type": "object",
@@ -75,22 +76,67 @@ class FormationReflexResponder:
                     "formation; I’ll countersign only after the protocol checks pass.")
         return "Thanks — I saw the invitation. I’m available and following the formation."
 
+    def _frontier(self, room: str, generation: int, source_table: str) -> tuple[int, bool]:
+        if source_table not in {"formation_events", "team_source_events"}:
+            raise ValueError("unsupported reflex source table")
+        row = self.state.db.execute(
+            "SELECT last_seq FROM formation_reflex_frontiers WHERE source_room=? "
+            "AND source_generation=?", (room, generation),
+        ).fetchone()
+        if row is not None:
+            return int(row["last_seq"]), False
+        processed = self.state.db.execute(
+            "SELECT max(source_seq) AS value FROM formation_reflex_processing "
+            "WHERE source_room=? AND source_generation=?", (room, generation),
+        ).fetchone()["value"]
+        if processed is None:
+            source = self.state.db.execute(
+                f"SELECT max(seq) AS value FROM {source_table} WHERE room=? AND generation=?",
+                (room, generation),
+            ).fetchone()["value"]
+            baseline = int(source or 0)
+        else:
+            # Upgrade of an already-running responder: continue after its last
+            # durable processing record instead of dropping later arrivals.
+            baseline = int(processed)
+        with self.state.db:
+            self.state.db.execute(
+                "INSERT INTO formation_reflex_frontiers(source_room,source_generation,last_seq) "
+                "VALUES(?,?,?)", (room, generation, baseline),
+            )
+        return baseline, True
+
+    def _advance_frontier(self, room: str, generation: int, seq: int) -> None:
+        self.state.db.execute(
+            "UPDATE formation_reflex_frontiers SET last_seq=max(last_seq,?),"
+            "updated_at=CURRENT_TIMESTAMP WHERE source_room=? AND source_generation=?",
+            (seq, room, generation),
+        )
+
     def _next_trigger(self, generation: int) -> tuple[dict[str, Any], dict[str, Any], str] | None:
+        frontier, activated = self._frontier(ROOMS.discovery, generation, "formation_events")
+        if activated:
+            return None
         rows = self.state.db.execute(
             "SELECT f.seq,f.event_kind,f.game_id,f.sender_did,f.normalized_payload,f.observed_at "
             "FROM formation_events f LEFT JOIN formation_reflex_processing p ON "
             "p.source_room=f.room AND p.source_generation=f.generation AND p.source_seq=f.seq "
-            "WHERE f.room=? AND f.generation=? AND f.verified=1 AND p.source_seq IS NULL "
-            "AND f.sender_did<>? AND f.event_kind IN "
-            "('TARGETED_RECRUITMENT_NOTE','ROSTER_CONSENT') ORDER BY f.seq LIMIT 1",
-            (ROOMS.discovery, generation, SARUKU_DID),
+            "WHERE f.room=? AND f.generation=? AND f.verified=1 AND f.seq>? "
+            "AND p.source_seq IS NULL AND f.event_kind IN "
+            "('TARGETED_RECRUITMENT_NOTE','ROSTER_CONSENT') ORDER BY f.seq LIMIT 256",
+            (ROOMS.discovery, generation, frontier),
         ).fetchall()
         for row in rows:
             raw = json.loads(row["normalized_payload"])
             try: payload = json.loads(raw.get("text", ""))
-            except json.JSONDecodeError: continue
+            except (TypeError, json.JSONDecodeError):
+                with self.state.db: self._advance_frontier(ROOMS.discovery, generation, row["seq"])
+                continue
             trigger = "targeted_invite" if row["event_kind"] == "TARGETED_RECRUITMENT_NOTE" else "saruku_roster"
-            if trigger == "saruku_roster" and SARUKU_DID not in payload.get("members", []):
+            if row["sender_did"] == SARUKU_DID or (
+                trigger == "saruku_roster" and SARUKU_DID not in payload.get("members", [])
+            ):
+                with self.state.db: self._advance_frontier(ROOMS.discovery, generation, row["seq"])
                 continue
             return dict(row), payload, trigger
         return None
@@ -98,12 +144,15 @@ class FormationReflexResponder:
     def _next_team_trigger(
         self, game_id: str, room: str, generation: int,
     ) -> tuple[dict[str, Any], dict[str, Any], str] | None:
+        frontier, activated = self._frontier(room, generation, "team_source_events")
+        if activated:
+            return None
         rows = self.state.db.execute(
             "SELECT s.seq,s.sender_did,s.payload FROM team_source_events s LEFT JOIN "
             "formation_reflex_processing p ON p.source_room=s.room AND "
             "p.source_generation=s.generation AND p.source_seq=s.seq WHERE s.room=? "
-            "AND s.generation=? AND s.verified=1 AND s.sender_did<>? AND p.source_seq IS NULL "
-            "ORDER BY s.seq", (room, generation, SARUKU_DID),
+            "AND s.generation=? AND s.verified=1 AND s.seq>? AND p.source_seq IS NULL "
+            "ORDER BY s.seq LIMIT 256", (room, generation, frontier),
         ).fetchall()
         aliases = re.compile(r"(?i)(?<![A-Za-z0-9_])@?saruku(?![A-Za-z0-9_])")
         for source in rows:
@@ -112,9 +161,10 @@ class FormationReflexResponder:
             except (TypeError, json.JSONDecodeError): payload = {}
             visible = payload.get("text") if isinstance(payload.get("text"), str) else text
             direct = payload.get("target_did") == SARUKU_DID
-            if not direct and not (isinstance(visible, str) and (
+            if source["sender_did"] == SARUKU_DID or (not direct and not (isinstance(visible, str) and (
                 aliases.search(visible) or SARUKU_DID in visible
-            )):
+            ))):
+                with self.state.db: self._advance_frontier(room, generation, source["seq"])
                 continue
             row = {"seq": source["seq"], "game_id": game_id,
                    "sender_did": source["sender_did"], "source_room": room,
@@ -172,6 +222,7 @@ class FormationReflexResponder:
                 (source_room, generation, row["seq"], game_id, trigger,
                  protocol_state, "LLM_STARTED"),
             )
+            self._advance_frontier(source_room, generation, row["seq"])
         fields = dict(game_id=game_id, source_room=source_room,
                       source_generation=generation, source_seq=row["seq"],
                       trigger_kind=trigger, protocol_state=protocol_state,
@@ -184,6 +235,10 @@ class FormationReflexResponder:
             self.journal("formation_reflex_llm_called", **fields)
             decision = self.llm.structured(TASK, {
                 "protocol_state": protocol_state, "trigger_kind": trigger,
+                "capabilities": {
+                    "authoritative_text": CAPABILITY_TEXT,
+                    "use_only_when_relevant": True,
+                },
                 "incoming": {"type": incoming.get("type"), "text": incoming.get("text"),
                              "game_id": game_id, "target_did": incoming.get("target_did")},
             }, "formation_reflex", REFLEX_SCHEMA)

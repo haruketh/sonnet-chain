@@ -149,8 +149,6 @@ class StateStore:
               ON formation_events(room,generation,game_id,seq);
             CREATE INDEX IF NOT EXISTS formation_events_kind_game_seq
               ON formation_events(room,generation,event_kind,game_id,seq);
-            CREATE INDEX IF NOT EXISTS formation_opportunities_game_seq
-              ON formation_opportunities(game_id,source_seq,consumed_at);
             CREATE INDEX IF NOT EXISTS formation_events_request
               ON formation_events(room,generation,request_id);
             CREATE TABLE IF NOT EXISTS formation_event_processing (
@@ -167,6 +165,13 @@ class StateStore:
               delivery_state TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               processed_at TEXT,
               PRIMARY KEY(source_room,source_generation,source_seq)
+            );
+            CREATE TABLE IF NOT EXISTS formation_reflex_frontiers (
+              source_room TEXT NOT NULL, source_generation INTEGER NOT NULL,
+              last_seq INTEGER NOT NULL,
+              activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(source_room,source_generation)
             );
             CREATE TABLE IF NOT EXISTS protocol_outbox (
               request_id TEXT PRIMARY KEY, action_kind TEXT NOT NULL,
@@ -213,6 +218,13 @@ class StateStore:
         for name, definition in (("consumed_at", "TEXT"), ("consumed_request_id", "TEXT")):
             if name not in opportunity_columns:
                 self.db.execute(f"ALTER TABLE formation_opportunities ADD COLUMN {name} {definition}")
+        self.db.commit()
+        # This index references additive columns and therefore must be created
+        # only after an existing v0.2 database has been ALTERed above.
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS formation_opportunities_game_seq "
+            "ON formation_opportunities(game_id,source_seq,consumed_at)"
+        )
         self.db.commit()
         # A normalized registration_accepted row could only have been created
         # after pinned-referee signature and schema verification. Historically
