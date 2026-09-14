@@ -72,6 +72,7 @@ class Config:
     rules_room: str = ROOMS.rules
     openai_api_key_file: Path | None = None
     model: str = "gpt-5.1"
+    reflex_model: str | None = None
     x_publish_cmd: str | None = None
     x_token_file: Path | None = None
     x_publish_state_db: Path = Path("state/publisher.sqlite3")
@@ -102,6 +103,7 @@ class Config:
             rules_room=ROOMS.rules,
             openai_api_key_file=Path(api_key).expanduser() if api_key else None,
             model=os.getenv("SONNET_MODEL", "gpt-5.1"),
+            reflex_model=os.getenv("SONNET_REFLEX_MODEL") or os.getenv("SONNET_MODEL", "gpt-5.1"),
             x_publish_cmd=os.getenv("SONNET_X_PUBLISH_CMD") or None,
             x_token_file=Path(x_token).expanduser() if x_token else None,
             x_publish_state_db=Path(os.getenv("SONNET_X_PUBLISH_STATE_DB", "state/publisher.sqlite3")),
@@ -114,7 +116,7 @@ class Config:
 
 RUNTIME_KEYS = {
     "SONNET_SEED_FILE", "SONNET_X_ACCOUNT_URL", "SONNET_OPENAI_API_KEY_FILE",
-    "SONNET_MODEL", "SONNET_X_PUBLISH_CMD", "SONNET_X_TOKEN_FILE",
+    "SONNET_MODEL", "SONNET_REFLEX_MODEL", "SONNET_X_PUBLISH_CMD", "SONNET_X_TOKEN_FILE",
     "SONNET_X_CLIENT_ID_FILE", "SONNET_X_CLIENT_SECRET_FILE", "SONNET_X_REDIRECT_URI",
     "SONNET_X_EXPECTED_USERNAME",
     "SONNET_X_PUBLISH_STATE_DB", "SONNET_REFEREE_DID", "SONNET_MANIFEST_SHA256",

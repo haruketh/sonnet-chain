@@ -134,6 +134,7 @@ class StateStore:
               opportunity_id TEXT PRIMARY KEY, game_id TEXT NOT NULL,
               inviter_did TEXT NOT NULL, source_seq INTEGER NOT NULL,
               payload_json TEXT NOT NULL,
+              consumed_at TEXT, consumed_request_id TEXT,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS formation_events (
@@ -146,12 +147,26 @@ class StateStore:
             );
             CREATE INDEX IF NOT EXISTS formation_events_game
               ON formation_events(room,generation,game_id,seq);
+            CREATE INDEX IF NOT EXISTS formation_events_kind_game_seq
+              ON formation_events(room,generation,event_kind,game_id,seq);
+            CREATE INDEX IF NOT EXISTS formation_opportunities_game_seq
+              ON formation_opportunities(game_id,source_seq,consumed_at);
             CREATE INDEX IF NOT EXISTS formation_events_request
               ON formation_events(room,generation,request_id);
             CREATE TABLE IF NOT EXISTS formation_event_processing (
               room TEXT NOT NULL, generation INTEGER NOT NULL, seq INTEGER NOT NULL,
               processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               PRIMARY KEY(room,generation,seq)
+            );
+            CREATE TABLE IF NOT EXISTS formation_reflex_processing (
+              source_room TEXT NOT NULL, source_generation INTEGER NOT NULL,
+              source_seq INTEGER NOT NULL, game_id TEXT NOT NULL,
+              trigger_kind TEXT NOT NULL, protocol_state TEXT NOT NULL,
+              status TEXT NOT NULL, llm_action TEXT, generator TEXT,
+              response_request_id TEXT, response_text_hash TEXT,
+              delivery_state TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              processed_at TEXT,
+              PRIMARY KEY(source_room,source_generation,source_seq)
             );
             CREATE TABLE IF NOT EXISTS protocol_outbox (
               request_id TEXT PRIMARY KEY, action_kind TEXT NOT NULL,
@@ -191,6 +206,13 @@ class StateStore:
                 self.db.execute(
                     f"ALTER TABLE team_source_processing ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
                 )
+        self.db.commit()
+        opportunity_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(formation_opportunities)").fetchall()
+        }
+        for name, definition in (("consumed_at", "TEXT"), ("consumed_request_id", "TEXT")):
+            if name not in opportunity_columns:
+                self.db.execute(f"ALTER TABLE formation_opportunities ADD COLUMN {name} {definition}")
         self.db.commit()
         # A normalized registration_accepted row could only have been created
         # after pinned-referee signature and schema verification. Historically
@@ -441,7 +463,8 @@ class StateStore:
 
     def formation_events(
         self, room: str, generation: int | None = None, *, game_id: str | None = None,
-        request_id: str | None = None,
+        request_id: str | None = None, event_kind: str | None = None,
+        min_seq: int | None = None, sender_did: str | None = None,
     ) -> list[dict[str, Any]]:
         clauses = ["room=?", "verified=1"]
         args: list[Any] = [room]
@@ -454,6 +477,15 @@ class StateStore:
         if request_id is not None:
             clauses.append("request_id=?")
             args.append(request_id)
+        if event_kind is not None:
+            clauses.append("event_kind=?")
+            args.append(event_kind)
+        if min_seq is not None:
+            clauses.append("seq>=?")
+            args.append(min_seq)
+        if sender_did is not None:
+            clauses.append("sender_did=?")
+            args.append(sender_did)
         rows = self.db.execute(
             "SELECT normalized_payload FROM formation_events WHERE " + " AND ".join(clauses)
             + " ORDER BY generation,seq", args,

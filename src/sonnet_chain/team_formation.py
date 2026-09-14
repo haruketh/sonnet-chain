@@ -404,6 +404,75 @@ class TeamFormationStore:
             )
         return cur.rowcount == 1
 
+    def opportunities(self, *, game_id: str | None = None) -> list[FormationOpportunity]:
+        sql = ("SELECT o.payload_json FROM formation_opportunities o WHERE o.consumed_at IS NULL "
+               "AND NOT EXISTS (SELECT 1 FROM formation_opportunities newer WHERE "
+               "newer.game_id=o.game_id AND newer.source_seq>o.source_seq)")
+        args: tuple[Any, ...] = ()
+        if game_id is not None:
+            sql += " AND o.game_id=?"; args = (game_id,)
+        sql += " ORDER BY o.source_seq DESC"
+        rows = self.state.db.execute(sql, args).fetchall()
+        out = []
+        for row in rows:
+            value = json.loads(row["payload_json"])
+            stamp = value.get("observed_at")
+            value["observed_at"] = datetime.fromisoformat(stamp) if isinstance(stamp, str) else None
+            out.append(FormationOpportunity(**value))
+        return out
+
+    def latest_opportunity(self, game_id: str) -> FormationOpportunity | None:
+        row = self.state.db.execute(
+            "SELECT payload_json FROM formation_opportunities WHERE game_id=? "
+            "ORDER BY source_seq DESC LIMIT 1", (game_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row["payload_json"])
+        stamp = value.get("observed_at")
+        value["observed_at"] = datetime.fromisoformat(stamp) if isinstance(stamp, str) else None
+        return FormationOpportunity(**value)
+
+    def consume_opportunity(
+        self, opportunity: FormationOpportunity, request_id: str, now: datetime,
+    ) -> bool:
+        opportunity_id = f"{opportunity.game_id}:{opportunity.inviter_did}:{opportunity.source_seq}"
+        with self.state.db:
+            cur = self.state.db.execute(
+                "UPDATE formation_opportunities SET consumed_at=?,consumed_request_id=?,"
+                "updated_at=CURRENT_TIMESTAMP WHERE opportunity_id=? AND consumed_at IS NULL",
+                (now.astimezone(timezone.utc).isoformat(), request_id, opportunity_id),
+            )
+        return cur.rowcount == 1
+
+    def opportunity_is_fresh_after_terminal(self, opportunity: FormationOpportunity) -> bool:
+        # Durable epoch source sequence is primary; legacy request timestamps
+        # conservatively consume notes observed no later than the application.
+        rows = self.state.db.execute(
+            "SELECT payload_json FROM formation_epochs WHERE game_id=? AND active=0",
+            (opportunity.game_id,),
+        ).fetchall()
+        for row in rows:
+            value = json.loads(row["payload_json"])
+            source = value.get("starting_invite_seq")
+            if isinstance(source, int) and opportunity.source_seq <= source:
+                return False
+        if opportunity.observed_at is not None:
+            row = self.state.db.execute(
+                "SELECT created_at FROM requests WHERE kind=? AND status IN "
+                "('expired','rejected','delivery_unknown','withdrawn') "
+                "ORDER BY created_at DESC LIMIT 1", (f"application:{opportunity.game_id}",),
+            ).fetchone()
+            if row is not None:
+                try:
+                    terminal_at = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+                    if terminal_at.tzinfo is None: terminal_at = terminal_at.replace(tzinfo=timezone.utc)
+                    if opportunity.observed_at <= terminal_at:
+                        return False
+                except ValueError:
+                    return False
+        return True
+
     def active_epoch(self) -> TeamFormationState | None:
         row = self.state.db.execute(
             "SELECT payload_json FROM formation_epochs WHERE active=1 LIMIT 1"

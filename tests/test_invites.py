@@ -53,8 +53,7 @@ def _invite(
             payload["poem_room"] = ROOMS.team(game_id)
             payload["room_generation"] = 3
     record = _signed(key, payload, seq)
-    if created_at is not None:
-        record["created_at"] = created_at
+    record["created_at"] = created_at or datetime.now(timezone.utc).isoformat()
     return record
 
 
@@ -297,12 +296,12 @@ def test_multiple_invites_select_only_newest_candidate(tmp_path: Path) -> None:
     daemon.state.record_event(
         ROOMS.discovery, 1, 1,
         _invite(Ed25519PrivateKey.generate(), game_id="older", seq=1,
-                created_at="2026-01-01T00:00:00Z"),
+                created_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()),
     )
     daemon.state.record_event(
         ROOMS.discovery, 2, 1,
         _invite(Ed25519PrivateKey.generate(), game_id="newer", seq=2,
-                created_at="2026-01-01T00:01:00Z"),
+                created_at=datetime.now(timezone.utc).isoformat()),
     )
     posted = []
     daemon._post = lambda room, payload: posted.append(payload)
@@ -321,12 +320,12 @@ def test_verified_room_outranks_newer_unverified_invite(tmp_path: Path) -> None:
     daemon.state.record_event(
         ROOMS.discovery, 1, 1,
         _invite(Ed25519PrivateKey.generate(), game_id="verified", seq=1,
-                created_at="2026-01-01T00:00:00Z", with_room=True),
+                created_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), with_room=True),
     )
     daemon.state.record_event(
         ROOMS.discovery, 2, 1,
         _invite(Ed25519PrivateKey.generate(), game_id="newer", seq=2,
-                created_at="2026-01-01T00:01:00Z"),
+                created_at=datetime.now(timezone.utc).isoformat()),
     )
 
     class TeamRoom:

@@ -11,6 +11,7 @@ import httpx
 
 from .cli import emit_or_post, signer_from
 from .config import CONTEST_ID, Config, ROOMS, SARUKU_DID
+from .formation_reflex import FormationReflexResponder
 from .formation_records import VerifiedFormationRecord
 from .decision import (
     Action, build_decision_state, coordination_key, coordination_text, decide,
@@ -19,7 +20,7 @@ from .decision import (
 from .launch import TrustedLaunch, owner_did, verify_launch_record
 from .journal import Journal
 from .invites import (
-    InviteCandidate, PendingApplication,
+    DirectInvite, InviteCandidate, PendingApplication,
     application_age_minutes,
     application_expiry_reason,
     choose_invite,
@@ -289,7 +290,8 @@ class Daemon:
                     normalized_kind = "ROSTER_WITHDRAWAL"
                     game_id = parsed_withdrawal[0]
             elif kind == "sonnet.note.v1":
-                if targeted_recruitment_note(raw, trusted) is not None:
+                opportunity = targeted_recruitment_note(raw, trusted)
+                if opportunity is not None:
                     normalized_kind = "TARGETED_RECRUITMENT_NOTE"
             elif (
                 kind == "sonnet.application.v1" and sender == SARUKU_DID
@@ -309,13 +311,24 @@ class Daemon:
                 payload.get("request_id") if isinstance(payload.get("request_id"), str) else None,
                 fingerprint, raw, stamp.isoformat() if stamp is not None else None,
             )
+            if normalized_kind == "TARGETED_RECRUITMENT_NOTE" and opportunity is not None:
+                if TeamFormationStore(self.state).save_opportunity(opportunity):
+                    self._journal(
+                        "formation_opportunity_observed", game_id=opportunity.game_id,
+                        source_seq=opportunity.source_seq,
+                        trusted_event_at=(opportunity.observed_at.isoformat()
+                                          if opportunity.observed_at else None),
+                        reason_code="trusted_targeted_recruitment_note",
+                    )
 
     def _formation_records(
         self, generation: int | None = None, *, game_id: str | None = None,
-        request_id: str | None = None,
+        request_id: str | None = None, event_kind: str | None = None,
+        min_seq: int | None = None, sender_did: str | None = None,
     ) -> list[dict[str, Any]]:
         return self.state.formation_events(
             ROOMS.discovery, generation, game_id=game_id, request_id=request_id,
+            event_kind=event_kind, min_seq=min_seq, sender_did=sender_did,
         )
 
     def _formation_invite_blocked(self, invite: Any) -> bool:
@@ -329,6 +342,22 @@ class Daemon:
                 return True
             prior_seq = payload.get("starting_invite_seq")
             if isinstance(prior_seq, int) and invite.seq <= prior_seq:
+                return True
+        return False
+
+    def _opportunity_has_live_structure(
+        self, opportunity: FormationOpportunity, generation: int, referee: str,
+    ) -> bool:
+        records = self._formation_records(
+            generation, game_id=opportunity.game_id, min_seq=opportunity.source_seq,
+        )
+        rosters = {
+            parsed[0] for raw in records
+            if (parsed := signed_roster(raw)) is not None and SARUKU_DID in parsed[0].members
+        }
+        for roster in rosters:
+            signers = current_roster_signers(records, roster)
+            if opportunity.inviter_did in signers and len(signers) >= 2 and self._team_room_open(roster, referee):
                 return True
         return False
 
@@ -879,6 +908,58 @@ class Daemon:
         self._receipts(ROOMS.registration)
         self._bootstrap_formation_state()
         self._reconcile_formation_transport()
+        _, reflex_generation = self.state.cursor(ROOMS.discovery)
+        if (
+            self.live and reflex_generation is not None
+            and self.cfg.openai_api_key_file is not None
+        ):
+            reflex = FormationReflexResponder(
+                self.state,
+                LLMClient(
+                    self.cfg.openai_api_key_file,
+                    self.cfg.reflex_model or self.cfg.model,
+                    timeout=10,
+                ),
+                self._journal, self._post, True,
+            ).run_once(reflex_generation)
+            if reflex.replied or (reflex.processed and reflex.payload is not None):
+                return
+            # Observe at most one currently relevant formation room per cycle.
+            # Room ownership/generation/completeness are checked before peer
+            # messages enter the durable verified source store.
+            formation = TeamFormationStore(self.state)
+            active_for_reflex = formation.active_epoch()
+            opportunity = (
+                formation.latest_opportunity(active_for_reflex.game_id)
+                if active_for_reflex is not None else None
+            )
+            if opportunity is None and active_for_reflex is None:
+                relevant = formation.opportunities()
+                opportunity = relevant[0] if relevant else None
+            referee = self.state.get("referee_did")
+            if (
+                opportunity is not None and opportunity.poem_room is not None
+                and opportunity.room_generation is not None and isinstance(referee, str)
+                and self._team_room_open(opportunity, referee)
+            ):
+                TeamIntelligence(self.state).sync_sources(
+                    opportunity.poem_room, opportunity.room_generation,
+                    self._trusted_writer_dids() | {referee}, referee,
+                )
+                reflex = FormationReflexResponder(
+                    self.state,
+                    LLMClient(
+                        self.cfg.openai_api_key_file,
+                        self.cfg.reflex_model or self.cfg.model,
+                        timeout=10,
+                    ),
+                    self._journal, self._post, True,
+                ).run_once(
+                    opportunity.room_generation, team_game_id=opportunity.game_id,
+                    team_room=opportunity.poem_room,
+                )
+                if reflex.replied or (reflex.processed and reflex.payload is not None):
+                    return
         active_epoch = TeamFormationStore(self.state).active_epoch()
         if active_epoch is not None and (
             active_epoch.possibly_consented or active_epoch.withdraw_pending
@@ -897,22 +978,25 @@ class Daemon:
         if self.state.active_team() is None and self.cfg.x_account_url:
             journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
             _, discovery_generation = self.state.cursor(ROOMS.discovery)
-            discovery_events = self._formation_records(discovery_generation)
+            scoped_game = active_epoch.game_id if active_epoch is not None else None
+            discovery_events = self._formation_records(
+                discovery_generation, game_id=scoped_game,
+                min_seq=(active_epoch.starting_invite_seq if active_epoch is not None else None),
+            ) if scoped_game is not None else []
             parsed_rosters = [
                 (item, parsed)
                 for item in discovery_events
                 if (parsed := signed_roster(item)) is not None
             ]
             signed_games = {
-                parsed[0].game_id
-                for _, parsed in parsed_rosters
-                if parsed[1] == SARUKU_DID
+                row["game_id"] for row in self.state.db.execute(
+                    "SELECT DISTINCT game_id FROM formation_events WHERE room=? AND generation=? "
+                    "AND verified=1 AND event_kind='ROSTER_CONSENT' AND sender_did=? "
+                    "AND game_id IS NOT NULL",
+                    (ROOMS.discovery, discovery_generation, SARUKU_DID),
+                ).fetchall()
             }
-            roster_games = {
-                parsed[0].game_id
-                for _, parsed in parsed_rosters
-                if SARUKU_DID in parsed[0].members
-            }
+            roster_games = {parsed[0].game_id for _, parsed in parsed_rosters}
             pending_app = pending_application(journal_path)
             if pending_app is not None and active_epoch is None:
                 durable = self.state.db.execute(
@@ -982,24 +1066,17 @@ class Daemon:
             selected = None
             if scan_candidates:
                 candidates = []
-                for event in discovery_events:
-                    invite = direct_invite(event, trusted_writer_dids=self._trusted_writer_dids())
-                    if invite is None:
+                formation_store = TeamFormationStore(self.state)
+                referee = self.state.get("referee_did")
+                for opportunity in formation_store.opportunities():
+                    if not formation_store.opportunity_is_fresh_after_terminal(opportunity):
                         continue
-                    opportunity = FormationOpportunity(
-                        invite.game_id, invite.from_did, invite.seq,
-                        datetime.fromtimestamp(invite.message_time, timezone.utc)
-                        if invite.message_time != float("-inf") else None,
-                        invite.poem_room, invite.room_generation,
+                    invite = DirectInvite(
+                        opportunity.game_id, opportunity.inviter_did,
+                        opportunity.poem_room, opportunity.room_generation, 1, False,
+                        opportunity.observed_at.timestamp() if opportunity.observed_at else float("-inf"),
+                        opportunity.source_seq,
                     )
-                    if TeamFormationStore(self.state).save_opportunity(opportunity):
-                        self._journal(
-                            "formation_opportunity_observed", game_id=invite.game_id,
-                            source_seq=invite.seq, trusted_event_at=(
-                                opportunity.observed_at.isoformat()
-                                if opportunity.observed_at else None
-                            ), reason_code="trusted_targeted_recruitment_note",
-                        )
                     if pending_app is not None and invite.game_id == pending_app.game_id:
                         continue
                     if (
@@ -1010,12 +1087,20 @@ class Daemon:
                         continue
                     room_verified = False
                     if invite.poem_room is not None:
-                        referee = self.state.get("referee_did")
                         if not isinstance(referee, str):
                             continue
                         if not self._team_room_open(invite, referee):
                             continue
                         room_verified = True
+                    stale_note = (
+                        opportunity.observed_at is None
+                        or now - opportunity.observed_at.astimezone(timezone.utc) >= timedelta(minutes=20)
+                    )
+                    if stale_note and not (
+                        isinstance(referee, str) and discovery_generation is not None
+                        and self._opportunity_has_live_structure(opportunity, discovery_generation, referee)
+                    ):
+                        continue
                     candidates.append(InviteCandidate(invite, room_verified))
                 selected = choose_invite(candidates)
                 if pending_app is not None and selected is not None and age is not None and age < 60:
@@ -1032,8 +1117,13 @@ class Daemon:
                         for item in candidates if item.invite.poem_room is not None
                         and item.invite.room_generation is not None
                     }
+                    candidate_records: list[dict[str, Any]] = []
+                    for candidate_game in {item.invite.game_id for item in candidates}:
+                        candidate_records.extend(self._formation_records(
+                            discovery_generation, game_id=candidate_game,
+                        ))
                     reduced = reduce_candidate_states(
-                        discovery_events, opportunities, verified_rooms
+                        candidate_records, opportunities, verified_rooms
                     )
                     referee = self.state.get("referee_did")
                     if isinstance(referee, str):
@@ -1047,7 +1137,7 @@ class Daemon:
                                 roster, referee
                             )
                         reduced = reduce_candidate_states(
-                            discovery_events, opportunities, verified_rooms
+                            candidate_records, opportunities, verified_rooms
                         )
                     challenger = max(
                         reduced, key=lambda item: (
@@ -1248,6 +1338,14 @@ class Daemon:
                     self.state.set("dry_run_action", payload)
                     return
                 now = datetime.now(timezone.utc)
+                selected_opportunity = next((
+                    item for item in TeamFormationStore(self.state).opportunities(game_id=selected.game_id)
+                    if item.inviter_did == selected.from_did and item.source_seq == selected.seq
+                ), None)
+                if selected_opportunity is None or not TeamFormationStore(self.state).consume_opportunity(
+                    selected_opportunity, payload["request_id"], now
+                ):
+                    return
                 epoch = start_epoch(
                     FormationOpportunity(
                         selected.game_id, selected.from_did, selected.seq, now,
@@ -1306,7 +1404,7 @@ class Daemon:
         if not isinstance(referee, str):
             return
         _, discovery_generation = self.state.cursor(ROOMS.discovery)
-        discovery_events = self._formation_records(discovery_generation)
+        discovery_events: list[dict[str, Any]] = []
         journal_path = self.cfg.state_db.parent / "journal" / "sonnet.jsonl"
         pending_game = pending_application(journal_path)
         active_epoch = TeamFormationStore(self.state).active_epoch()
@@ -1327,6 +1425,34 @@ class Daemon:
                 invite_seq=active_epoch.starting_invite_seq,
                 inviter_did=active_epoch.inviter_did,
             )
+        relevant_games = (
+            {pending_game.game_id} if pending_game is not None
+            else {item.game_id for item in TeamFormationStore(self.state).opportunities()}
+        )
+        for relevant_game in relevant_games:
+            discovery_events.extend(self._formation_records(
+                discovery_generation, game_id=relevant_game,
+                min_seq=(pending_game.invite_seq if pending_game is not None else None),
+            ))
+        if not relevant_games:
+            # Detect newly arriving pre-existing roster affirmations without
+            # decoding every historical roster on every idle cycle. Once a
+            # game appears in the incremental slice, load only that game's
+            # normalized formation facts for current-consent reduction.
+            frontier_key = f"formation_idle_roster_frontier:{discovery_generation}"
+            frontier = int(self.state.get(frontier_key, 0) or 0)
+            fresh_rosters = self._formation_records(
+                discovery_generation, event_kind="ROSTER_CONSENT", min_seq=frontier + 1,
+            )
+            if fresh_rosters:
+                self.state.set(frontier_key, max(int(item.get("seq", 0) or 0) for item in fresh_rosters))
+                for game in {
+                    parsed[0].game_id for item in fresh_rosters
+                    if (parsed := signed_roster(item)) is not None
+                }:
+                    discovery_events.extend(self._formation_records(
+                        discovery_generation, game_id=game,
+                    ))
         expired_games = {
             row["game_id"] for row in self.state.db.execute(
                 "SELECT game_id FROM formation_epochs WHERE active=0 "
@@ -1510,7 +1636,11 @@ class Daemon:
         )
 
         _, discovery_generation = self.state.cursor(ROOMS.discovery)
-        discovery_events = self._formation_records(discovery_generation)
+        active_epoch = TeamFormationStore(self.state).active_epoch()
+        discovery_events = self._formation_records(
+            discovery_generation, game_id=game_id,
+            min_seq=(active_epoch.starting_invite_seq if active_epoch is not None else None),
+        )
         withdraw_intent = self.state.unresolved_protocol_intent("withdraw")
         if withdraw_intent is not None and withdraw_intent.get("game_id") == game_id:
             reconciled = False
