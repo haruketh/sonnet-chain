@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from .active_acquisition import ActiveAcquisition
 from .cli import emit_or_post, signer_from
 from .config import CONTEST_ID, Config, ROOMS, SARUKU_DID
 from .formation_reflex import FormationReflexResponder
@@ -1068,6 +1069,13 @@ class Daemon:
                 candidates = []
                 formation_store = TeamFormationStore(self.state)
                 referee = self.state.get("referee_did")
+                acquisition = None
+                if discovery_generation is not None and isinstance(referee, str):
+                    acquisition = ActiveAcquisition(
+                        self.state, discovery_generation, self._trusted_writer_dids(),
+                        lambda roster: self._team_room_open(roster, referee), self._journal,
+                    )
+                    acquisition.scan(now)
                 for opportunity in formation_store.opportunities():
                     if not formation_store.opportunity_is_fresh_after_terminal(opportunity):
                         continue
@@ -1077,6 +1085,7 @@ class Daemon:
                         opportunity.lead_verified,
                         opportunity.observed_at.timestamp() if opportunity.observed_at else float("-inf"),
                         opportunity.source_seq,
+                        opportunity.opportunity_kind,
                     )
                     if pending_app is not None and invite.game_id == pending_app.game_id:
                         continue
@@ -1093,7 +1102,10 @@ class Daemon:
                         if not self._team_room_open(invite, referee):
                             continue
                         room_verified = True
-                    stale_note = (
+                    if opportunity.opportunity_kind == "ACTIVE_VACANCY":
+                        if acquisition is None or not acquisition.revalidate(opportunity, now):
+                            continue
+                    stale_note = opportunity.opportunity_kind == "TARGETED_INVITE" and (
                         opportunity.observed_at is None
                         or now - opportunity.observed_at.astimezone(timezone.utc) >= timedelta(minutes=20)
                     )
@@ -1103,7 +1115,10 @@ class Daemon:
                     ):
                         continue
                     candidates.append(InviteCandidate(invite, room_verified))
-                selected = choose_invite(candidates)
+                # Entry-source priority is not permission to preempt an epoch.
+                preferred = [item for item in candidates
+                             if item.invite.opportunity_kind == "TARGETED_INVITE"]
+                selected = choose_invite(preferred if pending_app is None and preferred else candidates)
                 if pending_app is not None and selected is not None and age is not None and age < 60:
                     opportunities = [
                         FormationOpportunity(
@@ -1334,24 +1349,49 @@ class Daemon:
                     if selected is None:
                         return
             if pending_app is None and selected is not None:
-                payload = team_application(selected.game_id, self.cfg.x_account_url)
-                if not self.live:
-                    self.state.set("dry_run_action", payload)
-                    return
                 now = datetime.now(timezone.utc)
                 selected_opportunity = next((
                     item for item in TeamFormationStore(self.state).opportunities(game_id=selected.game_id)
                     if item.inviter_did == selected.from_did and item.source_seq == selected.seq
                 ), None)
-                if selected_opportunity is None or not TeamFormationStore(self.state).consume_opportunity(
+                if selected_opportunity is None:
+                    return
+                active_vacancy = selected_opportunity.opportunity_kind == "ACTIVE_VACANCY"
+                if active_vacancy:
+                    # Refresh owner/open authority immediately before the
+                    # existing write-ahead executor; no independent write path.
+                    self._team_room_open_cache = {}
+                    if (
+                        TeamFormationStore(self.state).active_epoch() is not None
+                        or self.state.active_team() is not None
+                        or self.state.unresolved_protocol_intent("roster") is not None
+                        or self.state.unresolved_protocol_intent("withdraw") is not None
+                        or acquisition is None
+                        or not acquisition.revalidate(selected_opportunity, now)
+                    ):
+                        self._journal(
+                            "formation_active_search_candidate_invalidated",
+                            game_id=selected.game_id, source_seq=selected.seq,
+                            opportunity_kind="ACTIVE_VACANCY", reason_code="pre_application_revalidation_failed",
+                        )
+                        return
+                    self._journal(
+                        "formation_active_search_candidate_selected", game_id=selected.game_id,
+                        source_seq=selected.seq, opportunity_kind="ACTIVE_VACANCY",
+                        reason_code="verified_vacancy_selected", room_verified=True,
+                    )
+                payload = team_application(
+                    selected.game_id, self.cfg.x_account_url, active_vacancy=active_vacancy,
+                )
+                if not self.live:
+                    self.state.set("dry_run_action", payload)
+                    return
+                if not TeamFormationStore(self.state).consume_opportunity(
                     selected_opportunity, payload["request_id"], now
                 ):
                     return
                 epoch = start_epoch(
-                    FormationOpportunity(
-                        selected.game_id, selected.from_did, selected.seq, now,
-                        selected.poem_room, selected.room_generation,
-                    ), payload["request_id"], now,
+                    selected_opportunity, payload["request_id"], now,
                 )
                 self.state.persist_protocol_intent(
                     payload["request_id"], "application", ROOMS.discovery, payload,
@@ -1372,6 +1412,12 @@ class Daemon:
                     request_id=payload["request_id"], reason_code="send_intent_persisted",
                 )
                 self._post(ROOMS.discovery, payload)
+                if active_vacancy:
+                    self._journal(
+                        "formation_active_search_application_started", game_id=selected.game_id,
+                        source_seq=selected.seq, opportunity_kind="ACTIVE_VACANCY",
+                        request_id=payload["request_id"], reason_code="application_intent_sent",
+                    )
                 self._journal(
                     "team_application_sent",
                     game_id=selected.game_id,

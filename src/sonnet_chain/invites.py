@@ -24,6 +24,7 @@ class DirectInvite:
     lead_verified: bool
     message_time: float
     seq: int
+    opportunity_kind: str = "TARGETED_INVITE"
 
 
 @dataclass(frozen=True)

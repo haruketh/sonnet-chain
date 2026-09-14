@@ -149,6 +149,8 @@ class StateStore:
               ON formation_events(room,generation,game_id,seq);
             CREATE INDEX IF NOT EXISTS formation_events_kind_game_seq
               ON formation_events(room,generation,event_kind,game_id,seq);
+            CREATE INDEX IF NOT EXISTS formation_events_kind_seq
+              ON formation_events(room,generation,event_kind,seq);
             CREATE INDEX IF NOT EXISTS formation_events_request
               ON formation_events(room,generation,request_id);
             CREATE TABLE IF NOT EXISTS formation_event_processing (

@@ -151,6 +151,8 @@ class FormationOpportunity:
     poem_room: str | None = None
     room_generation: int | None = None
     lead_verified: bool = False
+    opportunity_kind: str = "TARGETED_INVITE"
+    source_generation: int | None = None
 
 
 def targeted_recruitment_note(
@@ -396,6 +398,8 @@ class TeamFormationStore:
 
     def save_opportunity(self, opportunity: FormationOpportunity) -> bool:
         opportunity_id = f"{opportunity.game_id}:{opportunity.inviter_did}:{opportunity.source_seq}"
+        if opportunity.opportunity_kind == "ACTIVE_VACANCY":
+            opportunity_id += f":vacancy:{opportunity.source_generation}"
         encoded = json.dumps(asdict(opportunity), ensure_ascii=False, separators=(",", ":"), default=str)
         with self.state.db:
             cur = self.state.db.execute(
@@ -409,6 +413,8 @@ class TeamFormationStore:
     def opportunities(self, *, game_id: str | None = None) -> list[FormationOpportunity]:
         sql = ("SELECT o.payload_json FROM formation_opportunities o WHERE o.consumed_at IS NULL "
                "AND NOT EXISTS (SELECT 1 FROM formation_opportunities newer WHERE "
+               "COALESCE(json_extract(newer.payload_json,'$.opportunity_kind'),'TARGETED_INVITE')="
+               "COALESCE(json_extract(o.payload_json,'$.opportunity_kind'),'TARGETED_INVITE') AND "
                "newer.game_id=o.game_id AND newer.source_seq>o.source_seq)")
         args: tuple[Any, ...] = ()
         if game_id is not None:
@@ -439,6 +445,8 @@ class TeamFormationStore:
         self, opportunity: FormationOpportunity, request_id: str, now: datetime,
     ) -> bool:
         opportunity_id = f"{opportunity.game_id}:{opportunity.inviter_did}:{opportunity.source_seq}"
+        if opportunity.opportunity_kind == "ACTIVE_VACANCY":
+            opportunity_id += f":vacancy:{opportunity.source_generation}"
         with self.state.db:
             cur = self.state.db.execute(
                 "UPDATE formation_opportunities SET consumed_at=?,consumed_request_id=?,"

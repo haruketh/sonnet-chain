@@ -51,7 +51,9 @@ def discovery_advertisement(rid: str | None = None) -> dict:
     }
 
 
-def team_application(game_id: str, x_account_url: str, rid: str | None = None) -> dict:
+def team_application(
+    game_id: str, x_account_url: str, rid: str | None = None, *, active_vacancy: bool = False,
+) -> dict:
     if not GAME_ID.fullmatch(game_id):
         raise ValueError("game_id must be 1-16 lowercase letters/digits/_/-, starting alphanumeric")
     if not isinstance(x_account_url, str) or not x_account_url:
@@ -65,6 +67,10 @@ def team_application(game_id: str, x_account_url: str, rid: str | None = None) -
         "x_account_url": x_account_url,
         "request_id": rid or request_id("application"),
         "text": (
+            f"Saruku is available to join {game_id} if you're still forming. "
+            "Registered Sonnet-2 writer. No live roster consent. "
+            "Ready to countersign the exact canonical roster when posted."
+        ) if active_vacancy else (
             f"YES {game_id}. Registered Sonnet-2 writer. No live roster consent. "
             "Ready to countersign the exact canonical roster when posted."
         ),
