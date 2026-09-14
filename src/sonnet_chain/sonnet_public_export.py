@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -127,7 +128,8 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
 
         rows = db.execute(
             "SELECT seq,event_kind,game_id,sender_did,normalized_payload,observed_at "
-            "FROM formation_events WHERE room=? AND verified=1 AND observed_at>=? AND event_kind IN "
+            "FROM formation_events WHERE room=? AND verified=1 "
+            "AND julianday(observed_at)>=julianday(?) AND event_kind IN "
             "('TARGETED_RECRUITMENT_NOTE','ROSTER_CONSENT','APPLICATION_READBACK') "
             "ORDER BY seq DESC LIMIT 160", (ROOMS.discovery, tracking_started),
         ).fetchall()
@@ -163,7 +165,8 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
         reflex = db.execute(
             "SELECT source_room,source_generation,source_seq,game_id,trigger_kind,protocol_state,"
             "status,response_request_id,processed_at FROM formation_reflex_processing "
-            "WHERE created_at>=? ORDER BY created_at DESC LIMIT 120", (tracking_started,),
+            "WHERE julianday(created_at)>=julianday(?) ORDER BY created_at DESC LIMIT 120",
+            (tracking_started,),
         ).fetchall()
         for row in reflex:
             at = _timestamp(row["processed_at"])
@@ -185,7 +188,8 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
 
         requests = db.execute(
             "SELECT kind,status,created_at FROM requests WHERE kind LIKE 'application:%' "
-            "AND created_at>=? ORDER BY created_at DESC LIMIT 80", (tracking_started,),
+            "AND julianday(created_at)>=julianday(?) ORDER BY created_at DESC LIMIT 80",
+            (tracking_started,),
         ).fetchall()
         for row in requests:
             at = _timestamp(row["created_at"])
@@ -195,38 +199,60 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
             activities.append(_activity("applied", at, "Applied",
                 "Saruku applied to join the team.", ("application", game_id, at), game_id))
 
-        current_events = {
-            "SIGNED": ("countersigned", "Roster signed", "Saruku signed the roster."),
-            "TEAM": ("team_ready", "Team ready", "The team is ready."),
-            "WRITING": ("writing", "Writing started", "Saruku’s team started writing."),
-            "COMPLETE": ("poem_complete", "Poem complete", "The poem is complete."),
-            "SUBMITTED": ("submitted", "Poem submitted", "The poem was submitted."),
+        # Only timestamped durable facts belong in the timeline. Current phase
+        # remains visible in the hero even when no authoritative transition
+        # timestamp exists.
+        receipt_rows = db.execute(
+            "SELECT r.room,r.generation,r.seq,r.kind,r.payload,e.payload AS raw_payload "
+            "FROM receipts r JOIN events e ON e.room=r.room AND e.generation=r.generation "
+            "AND e.seq=r.seq WHERE r.accepted=1 AND r.kind IN "
+            "('roster_ready','word_accepted','submission_accepted') "
+            "ORDER BY r.generation DESC,r.seq DESC LIMIT 120"
+        ).fetchall()
+        receipt_mapping = {
+            "roster_ready": ("team_ready", "Team ready", "The team is ready."),
+            "word_accepted": ("writing", "Writing progress", "A contribution was accepted."),
+            "submission_accepted": ("submitted", "Poem submitted", "The poem was submitted."),
         }
-        if stage in current_events:
-            kind, title, detail = current_events[stage]
-            activities.append(_activity(kind, checked, title, detail,
-                                        ("current-stage", stage, game), game_id=game))
+        for row in receipt_rows:
+            try:
+                raw = json.loads(row["raw_payload"]); payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            at = _timestamp(raw.get("created_at", raw.get("timestamp", raw.get("ts"))))
+            if at is None or at < tracking_started:
+                continue
+            kind, title, detail = receipt_mapping[row["kind"]]
+            game_id = payload.get("game_id") if isinstance(payload, dict) else None
+            activities.append(_activity(kind, at, title, detail,
+                                        ("receipt", row["room"], row["generation"], row["seq"]),
+                                        game_id if isinstance(game_id, str) else None))
 
         activities.sort(key=lambda item: (item["at"], item["id"]), reverse=True)
         activities = activities[:MAX_ACTIVITY]
         direct_mentions = db.execute(
-            "SELECT count(*) FROM formation_reflex_processing WHERE created_at>=? "
+            "SELECT count(*) FROM formation_reflex_processing "
+            "WHERE julianday(created_at)>=julianday(?) "
             "AND trigger_kind='team_direct_message'", (tracking_started,),
         ).fetchone()[0]
         reflex_replies = db.execute(
-            "SELECT count(*) FROM formation_reflex_processing WHERE created_at>=? AND status='REPLIED'",
+            "SELECT count(*) FROM formation_reflex_processing "
+            "WHERE julianday(created_at)>=julianday(?) AND status='REPLIED'",
             (tracking_started,),
         ).fetchone()[0]
         targeted_invites = db.execute(
-            "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 AND observed_at>=? "
+            "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 "
+            "AND julianday(observed_at)>=julianday(?) "
             "AND event_kind='TARGETED_RECRUITMENT_NOTE'", (ROOMS.discovery, tracking_started),
         ).fetchone()[0]
         applications = db.execute(
-            "SELECT count(*) FROM requests WHERE kind LIKE 'application:%' AND created_at>=?",
+            "SELECT count(*) FROM requests WHERE kind LIKE 'application:%' "
+            "AND julianday(created_at)>=julianday(?)",
             (tracking_started,),
         ).fetchone()[0]
         countersigns = db.execute(
-            "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 AND observed_at>=? "
+            "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 "
+            "AND julianday(observed_at)>=julianday(?) "
             "AND event_kind='ROSTER_CONSENT' AND sender_did=?",
             (ROOMS.discovery, tracking_started, SARUKU_DID),
         ).fetchone()[0]
@@ -300,12 +326,42 @@ def publish_document(document: dict[str, Any], account_id: str, namespace_id: st
     response.raise_for_status()
 
 
+def load_cloudflare_credentials(path: Path) -> tuple[str, str, str]:
+    try:
+        directory = path.parent.stat()
+        file_info = path.lstat()
+        if stat.S_IMODE(directory.st_mode) != 0o700 or directory.st_uid != os.getuid():
+            raise PublicExportError("Cloudflare credential directory permissions are unsafe")
+        if not stat.S_ISREG(file_info.st_mode) or stat.S_IMODE(file_info.st_mode) != 0o600 or file_info.st_uid != os.getuid():
+            raise PublicExportError("Cloudflare credential file permissions are unsafe")
+        if path.is_symlink() or file_info.st_size > 8192:
+            raise PublicExportError("Cloudflare credential file is unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if opened.st_ino != file_info.st_ino or opened.st_dev != file_info.st_dev:
+                raise PublicExportError("Cloudflare credential file changed during validation")
+            value = json.loads(os.read(fd, 8193).decode("utf-8"))
+        finally:
+            os.close(fd)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PublicExportError("Cloudflare credentials are unavailable") from exc
+    keys = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_SONNET_KV_NAMESPACE_ID", "CLOUDFLARE_SONNET_API_TOKEN")
+    if not isinstance(value, dict) or set(value) != set(keys) or any(
+        not isinstance(value.get(key), str) or not value[key].strip() for key in keys
+    ):
+        raise PublicExportError("Cloudflare credential file format is invalid")
+    return tuple(value[key].strip() for key in keys)  # type: ignore[return-value]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Export bounded public Sonnet mission state")
     parser.add_argument("--db", type=Path, default=Path("state/sonnet-chain.sqlite3"))
     parser.add_argument("--output", type=Path, default=Path("state/public/sonnet-latest.json"))
     parser.add_argument("--publish", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--credentials-file", type=Path)
     args = parser.parse_args(argv)
     try:
         document = build_public_document(args.db)
@@ -313,7 +369,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(document, ensure_ascii=False, indent=2)); return 0
         stage_document(document, args.output)
         if args.publish:
-            values = [os.getenv(name) for name in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_SONNET_KV_NAMESPACE_ID", "CLOUDFLARE_SONNET_API_TOKEN")]
+            values = list(load_cloudflare_credentials(args.credentials_file)) if args.credentials_file else [
+                os.getenv(name) for name in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_SONNET_KV_NAMESPACE_ID", "CLOUDFLARE_SONNET_API_TOKEN")
+            ]
             if not all(values):
                 raise PublicExportError("Sonnet Cloudflare publication is not configured")
             publish_document(document, values[0], values[1], values[2])

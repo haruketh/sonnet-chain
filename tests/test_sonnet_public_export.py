@@ -8,7 +8,8 @@ import pytest
 
 from sonnet_chain.config import ROOMS, SARUKU_DID
 from sonnet_chain.sonnet_public_export import (
-    PublicExportError, build_public_document, publish_document, stage_document,
+    PublicExportError, build_public_document, load_cloudflare_credentials,
+    publish_document, stage_document,
 )
 from sonnet_chain.state import Phase, StateStore
 
@@ -67,6 +68,24 @@ def test_direct_mention_reply_and_conflict_reason(tmp_path):
     assert "conflicting commitment" in detail and "FORMING_OTHER_GAME" not in detail
 
 
+def test_mixed_sqlite_and_iso_timestamps_are_compared_chronologically(tmp_path):
+    state = _state(tmp_path)
+    with state.db:
+        state.db.execute(
+            "INSERT INTO formation_reflex_processing(source_room,source_generation,source_seq,game_id,"
+            "trigger_kind,protocol_state,status,created_at,processed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (ROOMS.discovery, 2, 101, "g", "targeted_invite", "AVAILABLE", "REPLIED",
+             "2026-09-14 11:00:00", "2026-09-14 11:00:00"),
+        )
+    state.reserve_request("private", "application:g", {"game_id": "g"})
+    state.db.execute("UPDATE requests SET created_at='2026-09-14 11:00:00'")
+    _formation(state, 102, "TARGETED_RECRUITMENT_NOTE", {}, observed="2026-09-14T11:05:00+00:00")
+    document = build_public_document(state.path, NOW)
+    assert document["counts"]["reflex_replies"] == 1
+    assert document["counts"]["applications"] == 1
+    assert document["counts"]["targeted_invites"] == 1
+
+
 def test_application_roster_countersign_and_terminal_states(tmp_path):
     state = _state(tmp_path)
     state.reserve_request("secret-request", "application:g", {"game_id": "g"})
@@ -105,6 +124,16 @@ def test_export_is_stable_except_checked_at_and_invalid_does_not_replace(tmp_pat
     assert target.read_text(encoding="utf-8") == "last-good"
 
 
+def test_nonlooking_state_does_not_fabricate_moving_activity_time(tmp_path):
+    state = _state(tmp_path); state.phase = Phase.WRITING
+    one = build_public_document(state.path, NOW)
+    two = build_public_document(state.path, NOW.replace(minute=5))
+    one.pop("checked_at"); two.pop("checked_at")
+    assert one == two
+    assert one["mission"]["current_stage"] == "WRITING"
+    assert one["recent_activity"] == []
+
+
 def test_failed_kv_publish_does_not_change_staged_document(tmp_path, monkeypatch):
     state = _state(tmp_path); document = build_public_document(state.path, NOW)
     target = tmp_path / "latest.json"; stage_document(document, target); before = target.read_bytes()
@@ -113,6 +142,19 @@ def test_failed_kv_publish_does_not_change_staged_document(tmp_path, monkeypatch
     monkeypatch.setattr(httpx, "put", fail)
     with pytest.raises(httpx.ConnectError): publish_document(document, "account", "namespace", "secret")
     assert target.read_bytes() == before
+
+
+def test_protected_cloudflare_credentials_require_exact_modes(tmp_path):
+    private = tmp_path / "private"; private.mkdir(mode=0o700)
+    path = private / "sonnet_cloudflare.json"
+    path.write_text(json.dumps({
+        "CLOUDFLARE_ACCOUNT_ID": "account", "CLOUDFLARE_SONNET_KV_NAMESPACE_ID": "namespace",
+        "CLOUDFLARE_SONNET_API_TOKEN": "token",
+    }), encoding="utf-8"); path.chmod(0o600)
+    assert load_cloudflare_credentials(path) == ("account", "namespace", "token")
+    path.chmod(0o644)
+    with pytest.raises(PublicExportError, match="permissions"):
+        load_cloudflare_credentials(path)
 
 
 def test_large_unrelated_history_does_not_enter_public_query(tmp_path):
