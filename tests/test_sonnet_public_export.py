@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -39,6 +41,7 @@ def test_empty_discovery_is_seeking_team(tmp_path):
     state = _state(tmp_path); document = build_public_document(state.path, NOW)
     assert document["mission"]["status"] == "seeking_team"
     assert document["mission"]["current_stage"] == "LOOKING"
+    assert document["schema_version"] == 2 and document["writing"] is None
 
 
 def test_baseline_omits_old_invite_and_new_invite_is_public_safe(tmp_path):
@@ -113,6 +116,179 @@ def test_application_roster_countersign_and_terminal_states(tmp_path):
         if phase == Phase.DONE: state.set("submission_state", "accepted")
         current = build_public_document(state.path, NOW)
         assert (current["mission"]["status"], current["mission"]["current_stage"]) == (status, stage)
+
+
+def _writing_state(state, phase=Phase.WRITING):
+    state.phase = phase
+    state.set("active_team", "g")
+    state.set("current_roster", ["did:key:zAlpha", SARUKU_DID, "did:key:zBeta"])
+    state.set("team_setup", {"game_id": "g", "poem_room": ROOMS.team("g"),
+                             "room_generation": 7, "members": ["private"]})
+    state.set("poem_lines", ["Accepted first line", "Accepted second line"])
+    state.set("poem_version", 9)
+    state.set("previous_contributor", "did:key:zBeta")
+
+
+def _team_source(state, seq, sender, payload, *, generation=7, room=None, verified=True,
+                 observed="2026-09-14T11:30:00Z"):
+    room = room or ROOMS.team("g")
+    raw = {"seq": seq, "from": sender, "text": json.dumps(payload) if isinstance(payload, dict) else payload,
+           "created_at": observed, "sig": "private-signature", "request_id": "private-request"}
+    if verified:
+        state.persist_team_source(room, generation, seq, sender, raw,
+                                  payload.get("type") if isinstance(payload, dict) else None,
+                                  "private-request", "semantic")
+    else:
+        state.record_event(room, seq, generation, raw)
+
+
+def _receipt(state, seq, kind, payload, *, generation=7, room=None,
+             observed="2026-09-14T11:40:00Z"):
+    room = room or ROOMS.team("g")
+    raw = {"seq": seq, "from": "did:key:zReferee", "text": "{}",
+           "created_at": observed, "sig": "private-signature"}
+    state.record_event(room, seq, generation, raw)
+    with state.db:
+        state.db.execute(
+            "INSERT INTO receipts(room,generation,seq,kind,payload,accepted) VALUES(?,?,?,?,?,1)",
+            (room, generation, seq, kind, json.dumps(payload)),
+        )
+
+
+@pytest.mark.parametrize("phase", [Phase.WRITING, Phase.POEM_COMPLETE,
+                                   Phase.WAIT_SUBMISSION_RECEIPT, Phase.DONE])
+def test_writing_document_and_aliases_persist_through_terminal_phases(tmp_path, phase):
+    state = _state(tmp_path); _writing_state(state, phase)
+    if phase == Phase.DONE: state.set("submission_state", "accepted")
+    first = build_public_document(state.path, NOW)
+    second = build_public_document(state.path, NOW)
+    assert first["writing"] == second["writing"]
+    assert first["writing"] == {
+        "version": 9, "line_number": 3,
+        "lines": ["Accepted first line", "Accepted second line"],
+        "previous_contributor": "Teammate B",
+        "team": ["Teammate A", "Saruku", "Teammate B"], "activity": [],
+    }
+    assert "did:key" not in json.dumps(first)
+
+
+def test_verified_current_team_sources_only_and_proposal_never_changes_poem(tmp_path):
+    state = _state(tmp_path); _writing_state(state)
+    _team_source(state, 1, SARUKU_DID, {"type": "sonnet.note.v1", "contest_id": "sonnet-2", "text": "I can take it."})
+    _team_source(state, 2, "did:key:zAlpha", {"type": "sonnet.word.v1", "contest_id": "sonnet-2", "game_id": "g",
+                                             "room_generation": 7, "word": "drifts",
+                                             "request_id": "secret"})
+    _team_source(state, 3, "did:key:zOutside", {"type": "sonnet.note.v1", "contest_id": "sonnet-2", "text": "outsider"})
+    _team_source(state, 4, "did:key:zAlpha", {"type": "sonnet.note.v1", "contest_id": "sonnet-2", "text": "wrong generation"}, generation=8)
+    _team_source(state, 5, "did:key:zAlpha", {"type": "sonnet.note.v1", "contest_id": "sonnet-2", "text": "wrong room"}, room=ROOMS.team("other"))
+    _team_source(state, 6, "did:key:zAlpha", {"type": "sonnet.note.v1", "contest_id": "sonnet-2", "text": "unverified"}, verified=False)
+    _team_source(state, 7, "did:key:zAlpha", {"type": "sonnet.roster.v1", "members": []})
+    writing = build_public_document(state.path, NOW)["writing"]
+    assert writing["lines"] == ["Accepted first line", "Accepted second line"]
+    assert {(item["type"], item.get("quote")) for item in writing["activity"]} == {
+        ("word_proposed", "drifts"), ("message", "I can take it."),
+    }
+
+
+def test_authoritative_acceptance_line_and_completion_activity(tmp_path):
+    state = _state(tmp_path); _writing_state(state, Phase.POEM_COMPLETE)
+    _receipt(state, 1, "roster_ready", {"game_id": "g"}, room=ROOMS.discovery,
+             generation=2, observed="2026-09-14T11:00:00Z")
+    _receipt(state, 2, "word_accepted", {"game_id": "g", "version": 1,
+                                        "contributor_did": "did:key:zAlpha", "word": "drifts",
+                                        "lines": ["First line"]})
+    _receipt(state, 3, "word_accepted", {"game_id": "g", "version": 2,
+                                        "contributor_did": "did:key:zUnknown", "word": "night",
+                                        "lines": ["First line", "Second line"], "complete": True})
+    activity = build_public_document(state.path, NOW)["writing"]["activity"]
+    assert {item["type"] for item in activity} == {
+        "writing_started", "word_accepted", "line_completed", "poem_completed",
+    }
+    accepted = [item for item in activity if item["type"] == "word_accepted"]
+    assert any(item["detail"].startswith("Teammate A") for item in accepted)
+    assert any(item["detail"] == "A word was accepted." for item in accepted)
+
+
+def test_writing_activity_is_bounded_to_40_and_message_to_500(tmp_path):
+    state = _state(tmp_path); _writing_state(state)
+    for seq in range(1, 61):
+        _team_source(state, seq, "did:key:zAlpha", {"type": "sonnet.note.v1", "contest_id": "sonnet-2", "text": "x" * 700},
+                     observed=f"2026-09-14T11:{seq % 60:02d}:00Z")
+    activity = build_public_document(state.path, NOW)["writing"]["activity"]
+    assert len(activity) == 40
+    assert all(len(item["quote"]) == 500 for item in activity)
+
+
+def test_160_unrelated_rosters_cannot_hide_two_applications(tmp_path):
+    state = _state(tmp_path)
+    _formation(state, 101, "APPLICATION_READBACK", {}, sender=SARUKU_DID,
+               observed="2026-09-14T10:10:00Z")
+    members = ["did:key:zOne", "did:key:zTwo"]
+    for seq in range(102, 273):
+        _formation(state, seq, "ROSTER_CONSENT", {"members": members}, game=f"noise-{seq}")
+    _formation(state, 273, "APPLICATION_READBACK", {}, sender=SARUKU_DID,
+               observed="2026-09-14T11:50:00Z")
+    document = build_public_document(state.path, NOW)
+    assert document["counts"]["applications"] == 2
+    assert len([item for item in document["recent_activity"] if item["type"] == "applied"]) == 2
+
+
+def test_public_schema_has_no_private_structural_fields(tmp_path):
+    state = _state(tmp_path); _writing_state(state)
+    _team_source(state, 1, SARUKU_DID, {"type": "sonnet.note.v1", "contest_id": "sonnet-2", "text": "Public speech"})
+    document = build_public_document(state.path, NOW)
+    encoded = json.dumps(document)
+    assert "did:key" not in encoded
+    forbidden = {"request_id", "signature", "sig", "prompt", "confidence",
+                 "candidate_validation", "branch_count", "planner_state", "path", "token"}
+    def keys(value):
+        if isinstance(value, dict):
+            return set(value) | set().union(*(keys(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(keys(item) for item in value), set())
+        return set()
+    assert not forbidden & keys(document)
+
+
+def test_full_did_in_public_speech_is_dropped(tmp_path):
+    state = _state(tmp_path); _writing_state(state)
+    _team_source(state, 1, "did:key:zAlpha", {"type": "sonnet.note.v1",
+                 "contest_id": "sonnet-2", "text": "Ask did:key:zSecret about this."})
+    document = build_public_document(state.path, NOW)
+    assert document["writing"]["activity"] == []
+    assert "did:key" not in json.dumps(document)
+
+
+def test_synthetic_v2_export_is_bounded_and_indexed(tmp_path):
+    state = _state(tmp_path); _writing_state(state)
+    members = ["did:key:zOne", "did:key:zTwo"]
+    for seq in range(101, 272):
+        _formation(state, seq, "ROSTER_CONSENT", {"members": members}, game=f"noise-{seq}")
+    _formation(state, 272, "APPLICATION_READBACK", {}, sender=SARUKU_DID)
+    for seq in range(1, 41):
+        _team_source(state, seq, "did:key:zAlpha", {"type": "sonnet.note.v1",
+                     "contest_id": "sonnet-2", "text": f"Public message {seq}"},
+                     observed=f"2026-09-14T11:{seq:02d}:00Z")
+    # Raw/unverified and other-generation rows remain outside the public source.
+    _team_source(state, 41, "did:key:zAlpha", "raw unverified", verified=False)
+    _team_source(state, 42, "did:key:zAlpha", {"type": "sonnet.note.v1",
+                 "contest_id": "sonnet-2", "text": "wrong generation"}, generation=8)
+    elapsed = []
+    for _ in range(10):
+        started = time.perf_counter(); document = build_public_document(state.path, NOW)
+        elapsed.append(time.perf_counter() - started)
+    assert len(document["writing"]["activity"]) == 40
+    assert max(elapsed) < 0.25
+    readonly = sqlite3.connect(f"file:{state.path.resolve()}?mode=ro", uri=True)
+    plan = readonly.execute(
+        "EXPLAIN QUERY PLAN SELECT seq FROM formation_events WHERE room=? AND generation=? "
+        "AND verified=1 AND event_kind=? ORDER BY seq DESC LIMIT 40",
+        (ROOMS.discovery, 2, "APPLICATION_READBACK"),
+    ).fetchall()
+    assert any("formation_events_kind_seq" in str(row) for row in plan)
+    print({"runs": len(elapsed), "max_ms": round(max(elapsed) * 1000, 3),
+           "writing_activity": len(document["writing"]["activity"]),
+           "unrelated_rosters": 171})
 
 
 @pytest.mark.parametrize("request_status", ["pending", "delivery_unknown", "expired", "rejected"])

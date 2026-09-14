@@ -14,9 +14,9 @@ from typing import Any
 
 import httpx
 
-from .config import ROOMS, SARUKU_DID
+from .config import CONTEST_ID, ROOMS, SARUKU_DID
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 KV_KEY = "sonnet/latest.json"
 MAX_ACTIVITY = 40
 MISSION_TITLE = "SONNET MISSION"
@@ -82,6 +82,14 @@ def _tracking_baseline(db: sqlite3.Connection, checked_at: str) -> str:
     return _timestamp(row[0]) or checked_at
 
 
+def _tracked_generations(db: sqlite3.Connection) -> list[int]:
+    return [int(row[0]) for row in db.execute(
+        "SELECT generation FROM formation_history_state WHERE room=? UNION "
+        "SELECT source_generation FROM formation_reflex_frontiers WHERE source_room=? "
+        "ORDER BY 1", (ROOMS.discovery, ROOMS.discovery),
+    ).fetchall()]
+
+
 def _mission_state(db: sqlite3.Connection) -> tuple[str, str, str | None]:
     phase = _meta(db, "phase")
     active_team = _meta(db, "active_team")
@@ -116,6 +124,193 @@ def _mission_state(db: sqlite3.Connection) -> tuple[str, str, str | None]:
     return "seeking_team", "LOOKING", None
 
 
+def _aliases(roster: Any) -> tuple[dict[str, str], list[str]]:
+    if not isinstance(roster, list) or not 1 <= len(roster) <= 8:
+        return {}, []
+    if len(set(roster)) != len(roster) or not all(isinstance(item, str) for item in roster):
+        return {}, []
+    aliases: dict[str, str] = {}
+    next_alias = 0
+    for did in roster:
+        if did == SARUKU_DID:
+            aliases[did] = "Saruku"
+        else:
+            aliases[did] = f"Teammate {chr(ord('A') + next_alias)}"
+            next_alias += 1
+    return aliases, [aliases[did] for did in roster]
+
+
+def _public_note(raw: dict[str, Any]) -> str | None:
+    text = raw.get("text")
+    if not isinstance(text, str):
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        public = text[:500] if text.strip() else None
+        return None if public and "did:key:" in public else public
+    if (
+        not isinstance(payload, dict) or payload.get("type") != "sonnet.note.v1"
+        or payload.get("contest_id") != CONTEST_ID
+    ):
+        return None
+    public = payload.get("text")
+    public = public[:500] if isinstance(public, str) and public.strip() else None
+    return None if public and "did:key:" in public else public
+
+
+def _writing_state(
+    db: sqlite3.Connection, status: str, game: str | None,
+) -> dict[str, Any] | None:
+    if status not in {"writing", "poem_complete", "submission_pending", "submitted"}:
+        return None
+    setup = _meta(db, "team_setup")
+    roster = _meta(db, "current_roster")
+    if not isinstance(game, str) or not isinstance(setup, dict) or setup.get("game_id") != game:
+        return None
+    room, generation = setup.get("poem_room"), setup.get("room_generation")
+    if not isinstance(room, str) or room != ROOMS.team(game):
+        return None
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        return None
+    aliases, team = _aliases(roster)
+    if not team or SARUKU_DID not in aliases:
+        return None
+    lines = _meta(db, "poem_lines")
+    version = _meta(db, "poem_version")
+    if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+        lines = []
+    lines = [line[:1000] for line in lines[:14]]
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        version = 0
+    previous = _meta(db, "previous_contributor")
+    previous_alias = aliases.get(previous) if isinstance(previous, str) else None
+    activity: list[dict[str, Any]] = []
+
+    # The primary key (room,generation,seq) makes this a bounded tail read.
+    source_rows = db.execute(
+        "SELECT seq,sender_did,event_type,payload FROM team_source_events "
+        "WHERE room=? AND generation=? AND verified=1 ORDER BY seq DESC LIMIT 200",
+        (room, generation),
+    ).fetchall()
+    for row in source_rows:
+        actor = aliases.get(row["sender_did"])
+        if actor is None:
+            continue
+        try:
+            raw = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        at = _timestamp(raw.get("created_at", raw.get("timestamp", raw.get("ts"))))
+        if at is None:
+            continue
+        try:
+            payload = json.loads(raw.get("text", ""))
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("type") == "sonnet.word.v1":
+            if (
+                payload.get("contest_id") != CONTEST_ID or payload.get("game_id") != game
+                or payload.get("room_generation") != generation
+            ):
+                continue
+            word = payload.get("word")
+            if isinstance(word, str) and word.strip():
+                activity.append(_activity(
+                    "word_proposed", at, "Word proposed", f"{actor} proposed a word.",
+                    ("writing-proposal", room, generation, row["seq"]), game, word[:100],
+                ))
+            continue
+        note = _public_note(raw)
+        if note is not None:
+            activity.append(_activity(
+                "message", at, actor, "Team message.",
+                ("writing-message", room, generation, row["seq"]), game, note,
+            ))
+
+    receipt_rows = db.execute(
+        "SELECT r.seq,r.kind,r.payload,e.payload AS raw_payload FROM ("
+        "SELECT room,generation,seq,kind,payload FROM receipts WHERE room=? AND generation=? "
+        "AND accepted=1 ORDER BY seq DESC LIMIT 200) r "
+        "JOIN events e ON e.room=r.room AND e.generation=r.generation AND e.seq=r.seq "
+        "WHERE r.kind='word_accepted' ORDER BY r.seq DESC LIMIT 80",
+        (room, generation),
+    ).fetchall()
+    accepted: list[tuple[int, str, dict[str, Any], str]] = []
+    for row in receipt_rows:
+        try:
+            payload = json.loads(row["payload"]); raw = json.loads(row["raw_payload"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("game_id") != game:
+            continue
+        at = _timestamp(raw.get("created_at", raw.get("timestamp", raw.get("ts"))))
+        if at is None:
+            continue
+        accepted.append((row["seq"], at, payload, row["kind"]))
+
+    ready_rows = db.execute(
+        "SELECT r.seq,r.payload,e.payload AS raw_payload FROM (SELECT room,generation,seq,kind,payload "
+        "FROM receipts WHERE room=? AND accepted=1 ORDER BY generation DESC,seq DESC LIMIT 200) r "
+        "JOIN events e "
+        "ON e.room=r.room AND e.generation=r.generation AND e.seq=r.seq "
+        "WHERE r.kind='roster_ready' ORDER BY r.generation DESC,r.seq DESC LIMIT 20",
+        (ROOMS.discovery,),
+    ).fetchall()
+    for row in ready_rows:
+        try:
+            payload = json.loads(row["payload"]); raw = json.loads(row["raw_payload"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("game_id") != game:
+            continue
+        at = _timestamp(raw.get("created_at", raw.get("timestamp", raw.get("ts"))))
+        if at is not None:
+            activity.append(_activity(
+                "writing_started", at, "Writing started", "The team began writing.",
+                ("writing-started", ROOMS.discovery, row["seq"], game), game,
+            ))
+            break
+
+    accepted.sort(key=lambda item: item[0])
+    prior_lines = 0
+    for seq, at, payload, _ in accepted:
+        contributor = aliases.get(payload.get("contributor_did"))
+        word = payload.get("word")
+        detail = f"{contributor} contributed an accepted word." if contributor else "A word was accepted."
+        activity.append(_activity(
+            "word_accepted", at, "Word accepted", detail,
+            ("writing-accepted", room, generation, seq), game,
+            word[:100] if isinstance(word, str) and word.strip() else None,
+        ))
+        accepted_lines = payload.get("lines")
+        line_count = len(accepted_lines) if isinstance(accepted_lines, list) else prior_lines
+        if line_count > prior_lines:
+            for completed in range(prior_lines + 1, line_count + 1):
+                activity.append(_activity(
+                    "line_completed", at, "Line completed", f"Line {completed} was completed.",
+                    ("writing-line", room, generation, seq, completed), game,
+                ))
+        prior_lines = max(prior_lines, line_count)
+        if payload.get("complete") is True:
+            activity.append(_activity(
+                "poem_completed", at, "Poem completed", "The sonnet was completed.",
+                ("writing-complete", room, generation, seq), game,
+            ))
+    activity.sort(key=lambda item: (item["at"], item["id"]), reverse=True)
+    current_line = _meta(db, "line_number")
+    line_number = (
+        current_line if isinstance(current_line, int) and not isinstance(current_line, bool)
+        and 0 <= current_line <= 14
+        else min(14, len(lines) + (0 if len(lines) >= 14 else 1))
+    )
+    return {
+        "version": version, "line_number": line_number, "lines": lines,
+        "previous_contributor": previous_alias, "team": team,
+        "activity": activity[:MAX_ACTIVITY],
+    }
+
+
 def build_public_document(db_path: Path, now: datetime | None = None) -> dict[str, Any]:
     checked = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     uri = f"file:{db_path.resolve()}?mode=ro"
@@ -126,15 +321,32 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
         status, stage, game = _mission_state(db)
         activities: list[dict[str, Any]] = []
 
-        rows = db.execute(
-            "SELECT seq,event_kind,game_id,sender_did,normalized_payload,observed_at "
-            "FROM formation_events WHERE room=? AND verified=1 "
-            "AND julianday(observed_at)>=julianday(?) AND event_kind IN "
-            "('TARGETED_RECRUITMENT_NOTE','ROSTER_CONSENT','APPLICATION_READBACK') "
-            "ORDER BY seq DESC LIMIT 160", (ROOMS.discovery, tracking_started),
-        ).fetchall()
+        invitation_rows: list[sqlite3.Row] = []
+        application_rows: list[sqlite3.Row] = []
+        roster_rows: list[sqlite3.Row] = []
+        generations = _tracked_generations(db)
+        for generation in generations:
+            common = (ROOMS.discovery, generation, tracking_started)
+            invitation_rows.extend(db.execute(
+                "SELECT seq,event_kind,game_id,sender_did,normalized_payload,observed_at "
+                "FROM formation_events WHERE room=? AND generation=? AND verified=1 "
+                "AND julianday(observed_at)>=julianday(?) AND event_kind='TARGETED_RECRUITMENT_NOTE' "
+                "ORDER BY seq DESC LIMIT 40", common,
+            ).fetchall())
+            application_rows.extend(db.execute(
+                "SELECT seq,event_kind,game_id,sender_did,normalized_payload,observed_at "
+                "FROM formation_events WHERE room=? AND generation=? AND verified=1 "
+                "AND julianday(observed_at)>=julianday(?) AND event_kind='APPLICATION_READBACK' "
+                "ORDER BY seq DESC LIMIT 40", common,
+            ).fetchall())
+            roster_rows.extend(db.execute(
+                "SELECT seq,event_kind,game_id,sender_did,normalized_payload,observed_at "
+                "FROM formation_events WHERE room=? AND generation=? AND verified=1 "
+                "AND julianday(observed_at)>=julianday(?) AND event_kind='ROSTER_CONSENT' "
+                "ORDER BY seq DESC LIMIT 160", common,
+            ).fetchall())
         roster_seen: set[str] = set()
-        for row in rows:
+        for row in [*invitation_rows, *application_rows, *roster_rows]:
             at = _timestamp(row["observed_at"])
             if at is None or at < tracking_started:
                 continue
@@ -228,22 +440,19 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
             "WHERE julianday(created_at)>=julianday(?) AND status='REPLIED'",
             (tracking_started,),
         ).fetchone()[0]
-        targeted_invites = db.execute(
-            "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 "
-            "AND julianday(observed_at)>=julianday(?) "
-            "AND event_kind='TARGETED_RECRUITMENT_NOTE'", (ROOMS.discovery, tracking_started),
-        ).fetchone()[0]
-        applications = db.execute(
-            "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 "
-            "AND julianday(observed_at)>=julianday(?) AND event_kind='APPLICATION_READBACK'",
-            (ROOMS.discovery, tracking_started),
-        ).fetchone()[0]
-        countersigns = db.execute(
-            "SELECT count(*) FROM formation_events WHERE room=? AND verified=1 "
-            "AND julianday(observed_at)>=julianday(?) "
-            "AND event_kind='ROSTER_CONSENT' AND sender_did=?",
-            (ROOMS.discovery, tracking_started, SARUKU_DID),
-        ).fetchone()[0]
+        def formation_count(kind: str, sender: str | None = None) -> int:
+            total = 0
+            for generation in generations:
+                sql = ("SELECT count(*) FROM formation_events WHERE room=? AND generation=? "
+                       "AND verified=1 AND julianday(observed_at)>=julianday(?) AND event_kind=?")
+                args: tuple[Any, ...] = (ROOMS.discovery, generation, tracking_started, kind)
+                if sender is not None:
+                    sql += " AND sender_did=?"; args += (sender,)
+                total += int(db.execute(sql, args).fetchone()[0])
+            return total
+        targeted_invites = formation_count("TARGETED_RECRUITMENT_NOTE")
+        applications = formation_count("APPLICATION_READBACK")
+        countersigns = formation_count("ROSTER_CONSENT", SARUKU_DID)
         counts = {
             "direct_mentions": direct_mentions,
             "targeted_invites": targeted_invites,
@@ -255,13 +464,14 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
             "poems_completed": int(stage in {"COMPLETE", "SUBMITTED"}),
             "submissions": int(stage == "SUBMITTED"),
         }
+        writing = _writing_state(db, status, game)
         return validate_public_document({
             "schema_version": SCHEMA_VERSION, "checked_at": checked,
             "tracking_started_at": tracking_started,
             "mission": {"title": MISSION_TITLE, "goal": MISSION_GOAL,
                         "deadline": MISSION_DEADLINE, "status": status,
                         "current_stage": stage, "current_game": game},
-            "counts": counts, "recent_activity": activities,
+            "counts": counts, "recent_activity": activities, "writing": writing,
         })
     except sqlite3.Error as exc:
         raise PublicExportError("Sonnet public state is unavailable") from exc
@@ -286,8 +496,43 @@ def validate_public_document(value: Any) -> dict[str, Any]:
     for item in activity:
         if not isinstance(item, dict) or forbidden & set(item) or not all(isinstance(item.get(k), str) for k in ("id", "at", "type", "title", "detail")):
             raise PublicExportError("invalid activity item")
+    writing = value.get("writing")
+    if writing is not None:
+        if not isinstance(writing, dict) or set(writing) != {
+            "version", "line_number", "lines", "previous_contributor", "team", "activity"
+        }:
+            raise PublicExportError("invalid writing")
+        if (
+            not isinstance(writing["version"], int) or isinstance(writing["version"], bool)
+            or not isinstance(writing["line_number"], int) or isinstance(writing["line_number"], bool)
+            or not 0 <= writing["version"] or not 0 <= writing["line_number"] <= 14
+            or not isinstance(writing["lines"], list) or len(writing["lines"]) > 14
+            or not all(isinstance(line, str) and len(line) <= 1000 for line in writing["lines"])
+            or not isinstance(writing["team"], list) or not 1 <= len(writing["team"]) <= 8
+            or not all(isinstance(alias, str) and alias in {"Saruku", *{
+                f"Teammate {chr(ord('A') + index)}" for index in range(7)
+            }} for alias in writing["team"])
+            or writing["previous_contributor"] is not None
+            and writing["previous_contributor"] not in writing["team"]
+            or not isinstance(writing["activity"], list) or len(writing["activity"]) > MAX_ACTIVITY
+        ):
+            raise PublicExportError("invalid writing")
+        allowed_writing = {
+            "writing_started", "message", "word_proposed", "word_accepted",
+            "line_completed", "poem_completed",
+        }
+        for item in writing["activity"]:
+            if (
+                not isinstance(item, dict) or forbidden & set(item)
+                or item.get("type") not in allowed_writing
+                or not all(isinstance(item.get(key), str) for key in ("id", "at", "title", "detail"))
+                or "quote" in item and (not isinstance(item["quote"], str) or len(item["quote"]) > 500)
+            ):
+                raise PublicExportError("invalid writing activity")
     if _timestamp(value.get("checked_at")) is None or _timestamp(value.get("tracking_started_at")) is None:
         raise PublicExportError("invalid timestamps")
+    if "did:key:" in json.dumps(value, ensure_ascii=False):
+        raise PublicExportError("public DID leakage")
     return value
 
 
