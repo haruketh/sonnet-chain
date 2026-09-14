@@ -392,6 +392,8 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
             (tracking_started,),
         ).fetchall()
         for row in reflex:
+            if row["status"] == "NO_REPLY":
+                continue
             at = _timestamp(row["processed_at"])
             if at is None:
                 continue
@@ -405,9 +407,6 @@ def build_public_document(db_path: Path, now: datetime | None = None) -> dict[st
                           else "Saruku replied to the invitation.")
                 activities.append(_activity("replied", at, "Replied", detail,
                     identity + ("reply",), row["game_id"]))
-            elif row["status"] == "NO_REPLY":
-                activities.append(_activity("no_reply", at, "No reply",
-                    "No response was needed.", identity + ("no-reply",), row["game_id"]))
 
         # Only timestamped durable facts belong in the timeline. Current phase
         # remains visible in the hero even when no authoritative transition

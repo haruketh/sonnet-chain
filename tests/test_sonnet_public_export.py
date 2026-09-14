@@ -71,6 +71,30 @@ def test_direct_mention_reply_and_conflict_reason(tmp_path):
     assert "conflicting commitment" in detail and "FORMING_OTHER_GAME" not in detail
 
 
+def test_no_reply_is_internal_but_replied_remains_public(tmp_path):
+    state = _state(tmp_path)
+    rows = [
+        (ROOMS.team("g"), 4, 8, "g", "team_direct_message", "AVAILABLE", "REPLIED"),
+        (ROOMS.team("g"), 4, 9, "g", "team_direct_message", "FORMING_OTHER_GAME", "NO_REPLY"),
+        (ROOMS.discovery, 2, 10, "other", "targeted_invite", "AVAILABLE", "NO_REPLY"),
+    ]
+    with state.db:
+        state.db.executemany(
+            "INSERT INTO formation_reflex_processing(source_room,source_generation,source_seq,game_id,"
+            "trigger_kind,protocol_state,status,created_at,processed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            [(*row, "2026-09-14T11:30:00Z", "2026-09-14T11:30:00Z") for row in rows],
+        )
+    document = build_public_document(state.path, NOW)
+    assert document["counts"]["reflex_replies"] == 1
+    assert [item["type"] for item in document["recent_activity"]].count("replied") == 1
+    assert {item["type"] for item in document["recent_activity"]} == {
+        "called_by_name", "replied",
+    }
+    encoded = json.dumps(document)
+    assert "no_reply" not in encoded.casefold()
+    assert "reason_code" not in encoded
+
+
 def test_mixed_sqlite_and_iso_timestamps_are_compared_chronologically(tmp_path):
     state = _state(tmp_path)
     with state.db:
