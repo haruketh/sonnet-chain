@@ -1581,7 +1581,11 @@ class Daemon:
             ):
                 # Do not revive a roster completed before this fresh re-invite.
                 continue
-            if proposal.game_id in expired_games:
+            # A terminal historical epoch blocks unanchored roster discovery,
+            # but must not poison a later, explicitly anchored application
+            # epoch for the same game. Freshness remains enforced above by the
+            # exact game and post-invite consensus sequence checks.
+            if pending_game is None and proposal.game_id in expired_games:
                 continue
             history = TeamFormationStore(self.state).load_history(
                 ROOMS.discovery, discovery_generation

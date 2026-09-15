@@ -746,8 +746,14 @@ def test_v03_daemon_countersigns_with_two_external_current_signers(
         fromlist=["Journal"],
     ).Journal(tmp_path / "journal" / "sonnet.jsonl")
     observed_at = datetime.now(timezone.utc)
-    epoch = start_epoch(
+    old_epoch = start_epoch(
         FormationOpportunity("anchored", inviter, 1, observed_at),
+        "application-old", observed_at,
+    )
+    old_epoch.status = "hard_stalled"
+    TeamFormationStore(daemon.state).save_epoch(old_epoch, active=False)
+    epoch = start_epoch(
+        FormationOpportunity("anchored", inviter, 10, observed_at),
         "application-anchored", observed_at,
     )
     epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
@@ -759,7 +765,7 @@ def test_v03_daemon_countersigns_with_two_external_current_signers(
     )
 
     # The inviter and one peer sign after the application epoch began.
-    for seq, key in enumerate(keys[:2], 2):
+    for seq, key in enumerate(keys[:2], 11):
         raw = signed(key, ROOMS.discovery, roster_payload("anchored", members, f"r-{seq}"), seq)
         daemon.state.record_event(ROOMS.discovery, seq, 1, raw)
 
@@ -785,6 +791,80 @@ def test_v03_daemon_countersigns_with_two_external_current_signers(
         assert TeamFormationStore(daemon.state).active_epoch().formation_stage == (
             FormationStage.READY_TO_COUNTERSIGN
         )
+    finally:
+        daemon.state.close()
+
+
+@pytest.mark.parametrize("case", ["stale", "insufficient"])
+def test_fresh_epoch_still_rejects_stale_or_insufficient_progressive_roster(
+    tmp_path: Path, case: str,
+):
+    referee = did_of(Ed25519PrivateKey.generate())
+    daemon = daemon_fixture(tmp_path, referee)
+    daemon.live = False
+    daemon.state.phase = Phase.DISCOVERY
+    daemon.state.set("registered", True)
+    daemon.state.set("discovery_advertised", True)
+    daemon.state.set("deadline", "2099-01-01T00:00:00Z")
+    daemon.journal = __import__(
+        "sonnet_chain.journal", fromlist=["Journal"],
+    ).Journal(tmp_path / "journal" / "sonnet.jsonl")
+    keys, members = roster_fixture()
+    observed_at = datetime.now(timezone.utc)
+    epoch = start_epoch(
+        FormationOpportunity("repeat", members[0], 10, observed_at),
+        "application-repeat", observed_at,
+    )
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = observed_at.isoformat()
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+    daemon.state.reserve_request(
+        "application-repeat", "application:repeat",
+        {"type": "sonnet.application.v1", "game_id": "repeat"},
+    )
+    selected = keys[:2] if case == "stale" else keys[:1]
+    start_seq = 2 if case == "stale" else 11
+    for seq, key in enumerate(selected, start_seq):
+        daemon.state.record_event(
+            ROOMS.discovery, seq, 1,
+            signed(key, ROOMS.discovery, roster_payload("repeat", members, f"r-{seq}"), seq),
+        )
+
+    try:
+        daemon._discovery()
+        assert daemon.state.get("dry_run_action") is None
+    finally:
+        daemon.state.close()
+
+
+def test_historical_hard_stall_still_blocks_unanchored_roster_discovery(tmp_path: Path):
+    referee = did_of(Ed25519PrivateKey.generate())
+    daemon = daemon_fixture(tmp_path, referee)
+    daemon.live = False
+    daemon.state.phase = Phase.DISCOVERY
+    daemon.state.set("registered", True)
+    daemon.state.set("discovery_advertised", True)
+    daemon.state.set("deadline", "2099-01-01T00:00:00Z")
+    daemon.journal = __import__(
+        "sonnet_chain.journal", fromlist=["Journal"],
+    ).Journal(tmp_path / "journal" / "sonnet.jsonl")
+    keys, members = roster_fixture()
+    observed_at = datetime.now(timezone.utc)
+    old_epoch = start_epoch(
+        FormationOpportunity("expired", members[0], 1, observed_at),
+        "application-expired", observed_at,
+    )
+    old_epoch.status = "hard_stalled"
+    TeamFormationStore(daemon.state).save_epoch(old_epoch, active=False)
+    for seq, key in enumerate(keys, 2):
+        daemon.state.record_event(
+            ROOMS.discovery, seq, 1,
+            signed(key, ROOMS.discovery, roster_payload("expired", members, f"r-{seq}"), seq),
+        )
+
+    try:
+        daemon._discovery()
+        assert daemon.state.get("dry_run_action") is None
     finally:
         daemon.state.close()
 
