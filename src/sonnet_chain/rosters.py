@@ -147,6 +147,7 @@ def roster_consensus(
     saruku_did: str = SARUKU_DID,
     anchor_signer: str | None = None,
     min_anchor_seq: int | None = None,
+    min_external_signers: int | None = None,
 ) -> list[RosterConsensus]:
     current: dict[str, CanonicalRoster] = {}
     current_seq: dict[str, int] = {}
@@ -176,12 +177,14 @@ def roster_consensus(
         if anchor_signer is None:
             ready_now = set(candidate.members) - {saruku_did} <= signers
         else:
-            # v0.2 keeps Saruku as the last signer. The inviter anchors the
-            # application epoch, but does not substitute for the other current
-            # consents on the exact canonical roster.
+            external_signers = (set(candidate.members) - {saruku_did}) & signers
             ready_now = (
                 anchor_signer in signers
-                and set(candidate.members) - {saruku_did} <= signers
+                and (
+                    len(external_signers) >= min_external_signers
+                    if min_external_signers is not None
+                    else set(candidate.members) - {saruku_did} <= signers
+                )
                 and (
                     min_anchor_seq is None
                     or current_seq.get(anchor_signer, 0) > min_anchor_seq

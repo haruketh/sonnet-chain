@@ -49,6 +49,7 @@ from .team_formation import (
     FormationStage, TeamFormationStore,
     StructuralKey, formation_decision, formation_watchdog, materially_stronger,
     reduce_candidate_states, roster_fingerprint, start_epoch,
+    MIN_EXTERNAL_COUNTERSIGNERS,
     targeted_recruitment_note,
 )
 from .writing import WritingPlanner, build_writing_context, validate_writing_candidate
@@ -573,6 +574,14 @@ class Daemon:
                         epoch_id=epoch.epoch_id, source_seq=seq,
                         reason_code="latest_action_withdrawal",
                     )
+        progressively_ready = {
+            item.roster for item in roster_consensus(
+                discovery_events,
+                anchor_signer=epoch.inviter_did,
+                min_anchor_seq=epoch.starting_invite_seq,
+                min_external_signers=MIN_EXTERNAL_COUNTERSIGNERS,
+            )
+        }
         candidates: list[tuple[tuple[Any, ...], CanonicalRoster, StructuralKey, datetime, int]] = []
         seen: set[CanonicalRoster] = set()
         for raw in discovery_events:
@@ -585,7 +594,7 @@ class Daemon:
             seen.add(roster)
             signers = current_roster_signers(discovery_events, roster)
             missing = len(set(roster.members) - set(signers))
-            ready = set(roster.members) - {SARUKU_DID} <= set(signers)
+            ready = roster in progressively_ready
             stage = FormationStage.READY_TO_COUNTERSIGN if ready else (
                 FormationStage.ROSTER_PROGRESSING if len(signers) > 1
                 else FormationStage.ROSTER_PROPOSED
@@ -1212,6 +1221,7 @@ class Daemon:
                             discovery_events,
                             anchor_signer=pending_app.inviter_did,
                             min_anchor_seq=pending_app.invite_seq,
+                            min_external_signers=MIN_EXTERNAL_COUNTERSIGNERS,
                         )
                     )
                 if age is not None and age >= 20:
@@ -1542,10 +1552,15 @@ class Daemon:
             if anchor_signer is not None and pending_game is not None
             else None
         )
+        if active_epoch is not None:
+            self._reduce_epoch_structure(active_epoch, discovery_events)
         consensus_candidates = roster_consensus(
             discovery_events,
             anchor_signer=anchor_signer,
             min_anchor_seq=min_anchor_seq,
+            min_external_signers=(
+                MIN_EXTERNAL_COUNTERSIGNERS if anchor_signer is not None else None
+            ),
         )
         if pending_game is not None:
             compatible = [item for item in consensus_candidates if item.roster.game_id == pending_game.game_id]
@@ -1589,13 +1604,13 @@ class Daemon:
                 roster_fingerprint=roster_fingerprint(proposal),
                 signer_count=len(consensus.signers), member_count=len(proposal.members),
                 missing_signers=len(set(proposal.members) - set(consensus.signers)),
-                reason_code="unique_complete_inviter_anchored_roster",
+                reason_code="progressive_inviter_anchored_roster",
             )
             self._journal(
                 "formation_ready_to_countersign", game_id=proposal.game_id,
                 source_seq=consensus.completed_at_seq,
                 roster_fingerprint=roster_fingerprint(proposal),
-                reason_code="all_other_members_current_consent",
+                reason_code="sufficient_external_current_consent",
                 decision="COUNTERSIGN",
             )
             payload = proposal.payload(request_id("roster"))

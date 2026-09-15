@@ -10,7 +10,7 @@ from typing import Any, Iterable
 from .config import CONTEST_ID, ROOMS, SARUKU_DID
 from .formation_records import VerifiedFormationRecord
 from .launch import DID_KEY
-from .rosters import CanonicalRoster, signed_roster, signed_withdrawal
+from .rosters import CanonicalRoster, roster_consensus, signed_roster, signed_withdrawal
 from .signing import verify_room_signature
 from .state import StateStore
 
@@ -18,6 +18,7 @@ SOFT_STALL = timedelta(minutes=20)
 HARD_STALL = timedelta(minutes=60)
 APPLICATION_RECONCILE_WINDOW = timedelta(minutes=10)
 REPLACEMENT_RECOVERY_GRACE = timedelta(minutes=20)
+MIN_EXTERNAL_COUNTERSIGNERS = 2
 
 
 class ApplicationDelivery(StrEnum):
@@ -246,6 +247,14 @@ def reduce_candidate_states(
     verified = room_verified or {}
     out: list[FormationCandidateState] = []
     for opportunity in opportunities:
+        progressively_ready = {
+            item.roster for item in roster_consensus(
+                records,
+                anchor_signer=opportunity.inviter_did,
+                min_anchor_seq=opportunity.source_seq,
+                min_external_signers=MIN_EXTERNAL_COUNTERSIGNERS,
+            )
+        }
         variants: set[CanonicalRoster] = set()
         for record in records:
             parsed = signed_roster(record)
@@ -262,7 +271,7 @@ def reduce_candidate_states(
             missing = len(set(roster.members) - signers)
             stage = (
                 FormationStage.READY_TO_COUNTERSIGN
-                if set(roster.members) - {SARUKU_DID} <= signers
+                if roster in progressively_ready
                 else FormationStage.ROSTER_PROGRESSING if len(signers) > 1
                 else FormationStage.ROSTER_PROPOSED
             )

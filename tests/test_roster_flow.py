@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,10 @@ from sonnet_chain.daemon import Daemon
 from sonnet_chain.rosters import roster_consensus, signed_roster, team_room_is_open
 from sonnet_chain.signing import Signer, did_of
 from sonnet_chain.state import Phase, StateStore
+from sonnet_chain.team_formation import (
+    ApplicationDelivery, FormationOpportunity, FormationStage, MIN_EXTERNAL_COUNTERSIGNERS,
+    TeamFormationStore, start_epoch,
+)
 
 
 def signed(key: Ed25519PrivateKey, room: str, payload: dict, seq: int) -> dict:
@@ -591,6 +596,91 @@ def test_v02_anchored_consensus_requires_all_other_signers():
     assert result[0].signers == frozenset(members[:-1])
 
 
+@pytest.mark.parametrize("member_count", [4, 5, 8])
+def test_progressive_countersign_accepts_inviter_plus_one_for_all_team_sizes(
+    member_count: int,
+):
+    keys = [Ed25519PrivateKey.generate() for _ in range(member_count - 1)]
+    members = [did_of(key) for key in keys] + [SARUKU_DID]
+    records = [
+        signed(key, ROOMS.discovery, roster_payload("progressive", members, f"r-{seq}"), seq)
+        for seq, key in enumerate(keys[:2], 2)
+    ]
+
+    result = roster_consensus(
+        records,
+        anchor_signer=members[0],
+        min_anchor_seq=1,
+        min_external_signers=MIN_EXTERNAL_COUNTERSIGNERS,
+    )
+
+    assert len(result) == 1
+    assert result[0].signers == frozenset(members[:2])
+
+
+def test_progressive_countersign_requires_inviter_and_second_current_signer():
+    keys, members = roster_fixture()
+    payload = roster_payload("progressive", members, "r")
+    inviter_only = [signed(keys[0], ROOMS.discovery, payload, 2)]
+    others_only = [
+        signed(keys[1], ROOMS.discovery, payload, 2),
+        signed(keys[2], ROOMS.discovery, payload, 3),
+    ]
+
+    for records in (inviter_only, others_only):
+        assert roster_consensus(
+            records,
+            anchor_signer=members[0],
+            min_anchor_seq=1,
+            min_external_signers=MIN_EXTERNAL_COUNTERSIGNERS,
+        ) == []
+
+
+def test_progressive_countersign_does_not_combine_variants_or_stale_consent():
+    keys, members = roster_fixture()
+    variant = [members[0], members[2], members[1], SARUKU_DID]
+    records = [
+        signed(keys[0], ROOMS.discovery, roster_payload("progressive", members, "old"), 1),
+        signed(keys[1], ROOMS.discovery, roster_payload("progressive", variant, "variant"), 3),
+    ]
+    assert roster_consensus(
+        records, anchor_signer=members[0], min_anchor_seq=1,
+        min_external_signers=MIN_EXTERNAL_COUNTERSIGNERS,
+    ) == []
+
+    records.append(signed(keys[0], ROOMS.discovery, roster_payload("progressive", members, "fresh"), 4))
+    records.append(signed(keys[1], ROOMS.discovery, roster_payload("progressive", members, "peer"), 5))
+    assert len(roster_consensus(
+        records, anchor_signer=members[0], min_anchor_seq=1,
+        min_external_signers=MIN_EXTERNAL_COUNTERSIGNERS,
+    )) == 1
+
+
+@pytest.mark.parametrize("replacement", ["withdraw", "variant"])
+def test_progressive_second_signer_must_remain_on_exact_roster(replacement: str):
+    keys, members = roster_fixture()
+    exact = roster_payload("progressive", members, "exact")
+    records = [
+        signed(keys[0], ROOMS.discovery, exact, 2),
+        signed(keys[1], ROOMS.discovery, exact, 3),
+    ]
+    if replacement == "withdraw":
+        payload = {
+            "type": "sonnet.withdraw.v1", "contest_id": CONTEST_ID,
+            "game_id": "progressive", "request_id": "withdraw-peer",
+        }
+    else:
+        payload = roster_payload(
+            "progressive", [members[0], members[2], members[1], SARUKU_DID], "changed"
+        )
+    records.append(signed(keys[1], ROOMS.discovery, payload, 4))
+
+    assert roster_consensus(
+        records, anchor_signer=members[0], min_anchor_seq=1,
+        min_external_signers=MIN_EXTERNAL_COUNTERSIGNERS,
+    ) == []
+
+
 def test_b2_non_inviter_signature_is_not_enough_for_anchored_consensus():
     keys, members = roster_fixture()
     inviter = did_of(keys[0])
@@ -636,10 +726,11 @@ def test_b2_inviter_withdrawal_removes_anchor_readiness():
     ) == []
 
 
-def test_b2_daemon_countersigns_when_all_peers_sign_exact_roster(
+def test_v03_daemon_countersigns_with_two_external_current_signers(
     tmp_path: Path,
 ):
-    referee = did_of(Ed25519PrivateKey.generate())
+    referee_key = Ed25519PrivateKey.generate()
+    referee = did_of(referee_key)
     daemon = daemon_fixture(tmp_path, referee)
     daemon.live = False
     daemon.state.phase = Phase.DISCOVERY
@@ -654,16 +745,21 @@ def test_b2_daemon_countersigns_when_all_peers_sign_exact_roster(
         "sonnet_chain.journal",
         fromlist=["Journal"],
     ).Journal(tmp_path / "journal" / "sonnet.jsonl")
-    daemon.journal.append(
-        "team_application_sent",
-        game_id="anchored",
-        target_from_did=inviter,
-        request_id="application-anchored",
-        invite_seq=1,
+    observed_at = datetime.now(timezone.utc)
+    epoch = start_epoch(
+        FormationOpportunity("anchored", inviter, 1, observed_at),
+        "application-anchored", observed_at,
+    )
+    epoch.application_delivery_state = ApplicationDelivery.CONFIRMED
+    epoch.application_observed_at = observed_at.isoformat()
+    TeamFormationStore(daemon.state).save_epoch(epoch)
+    daemon.state.reserve_request(
+        "application-anchored", "application:anchored",
+        {"type": "sonnet.application.v1", "game_id": "anchored"},
     )
 
-    # All peers, including the inviter, sign after the application epoch began.
-    for seq, key in enumerate(keys, 2):
+    # The inviter and one peer sign after the application epoch began.
+    for seq, key in enumerate(keys[:2], 2):
         raw = signed(key, ROOMS.discovery, roster_payload("anchored", members, f"r-{seq}"), seq)
         daemon.state.record_event(ROOMS.discovery, seq, 1, raw)
 
@@ -672,16 +768,23 @@ def test_b2_daemon_countersigns_when_all_peers_sign_exact_roster(
             return referee
 
         def read_page(self, room, since, wait):
-            return [], 3
+            return [signed(
+                referee_key, room,
+                {"type": "sonnet.note.v1", "contest_id": CONTEST_ID, "game_id": "anchored"}, 1,
+            )], 3
 
     daemon.tc = TeamRoom()
 
     try:
         daemon._discovery()
         action = daemon.state.get("dry_run_action")
+        assert action is not None
         assert action["type"] == "sonnet.roster.v1"
         assert action["game_id"] == "anchored"
         assert action["members"] == members
+        assert TeamFormationStore(daemon.state).active_epoch().formation_stage == (
+            FormationStage.READY_TO_COUNTERSIGN
+        )
     finally:
         daemon.state.close()
 

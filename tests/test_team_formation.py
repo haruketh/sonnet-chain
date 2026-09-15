@@ -15,7 +15,7 @@ from sonnet_chain.team_formation import (
     ApplicationDelivery, ConsentDelivery, FormationHistoryState, FormationOpportunity,
     FormationStage, StructuralKey, TeamFormationState, TeamFormationStore,
     formation_decision, formation_watchdog, latest_consent, materially_stronger,
-    start_epoch, targeted_recruitment_note,
+    reduce_candidate_states, start_epoch, targeted_recruitment_note,
 )
 
 
@@ -112,6 +112,25 @@ def test_latest_action_consent_sequences():
     assert latest_consent([sign_a, withdraw], "g", did).state == "NONE"
     resign = signed(signer, roster_payload("g", members, "b"), 3)
     assert latest_consent([sign_a, withdraw, resign], "g", did).state == "ROSTER"
+
+
+def test_candidate_reducer_marks_progressive_inviter_anchored_roster_ready():
+    keys = [Ed25519PrivateKey.generate() for _ in range(3)]
+    members = [did_of(key) for key in keys] + [SARUKU_DID]
+    now = datetime.now(timezone.utc)
+    opportunity = FormationOpportunity("g", members[0], 1, now)
+    records = [
+        signed(keys[0], roster_payload("g", members, "anchor"), 2),
+        signed(keys[1], roster_payload("g", members, "second"), 3),
+    ]
+
+    reduced = reduce_candidate_states(records, [opportunity])
+
+    assert reduced[0].structural_key.signer_count == 2
+    assert reduced[0].structural_key.missing_signers == 2
+    assert reduced[0].structural_key.stage_rank == list(FormationStage).index(
+        FormationStage.READY_TO_COUNTERSIGN
+    )
 
 
 def test_gap_after_consent_is_unknown():
