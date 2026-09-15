@@ -231,7 +231,10 @@ def test_publisher_401_refresh_retry_success(tmp_path: Path):
     def handler(request):
         nonlocal calls
         calls += 1
-        return httpx.Response(401 if calls == 1 else 200, json={} if calls == 1 else {"data": {"id": "tweet"}})
+        return httpx.Response(
+            401 if calls == 1 else 200,
+            json={} if calls == 1 else {"data": {"id": "tweet", "text": "poem"}},
+        )
     manager = RetryManager()
     adapter = XPublisherAdapter(manager, tmp_path / "publisher.db", httpx.Client(transport=httpx.MockTransport(handler)))
     try: result = adapter.publish(["poem"], False)

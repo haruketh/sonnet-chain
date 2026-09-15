@@ -98,9 +98,32 @@ def receipt_candidate(room: str, raw: dict, referee_did: str) -> NormalizedRecei
             if valid_roster_receipt and payload.get("status") == "rejected":
                 return NormalizedReceipt("roster_rejected", payload)
 
+        if room == ROOMS.submissions:
+            # Observed live generic schema.  It intentionally has no game_id:
+            # accepted receipts carry entry_id, while both outcomes bind the
+            # authenticated submitter through sender_did and the stable request.
+            valid_common = (
+                isinstance(payload.get("request_id"), str)
+                and bool(payload["request_id"])
+                and isinstance(payload.get("sender_did"), str)
+                and payload["sender_did"].startswith("did:key:")
+                and isinstance(payload.get("intake_seq"), int)
+            )
+            if valid_common and payload.get("status") == "accepted" and (
+                isinstance(payload.get("entry_id"), str) and bool(payload["entry_id"])
+            ):
+                return NormalizedReceipt("submission_accepted", payload)
+            if valid_common and payload.get("status") == "rejected" and isinstance(
+                payload.get("reason"), str
+            ):
+                return NormalizedReceipt("submission_rejected", payload)
+
         return NormalizedReceipt("unknown", payload)
 
-    return NormalizedReceipt(KNOWN.get(payload.get("type"), "unknown"), payload)
+    kind = KNOWN.get(payload.get("type"), "unknown")
+    if kind != "unknown" and payload.get("contest_id") != CONTEST_ID:
+        return NormalizedReceipt("unknown", payload)
+    return NormalizedReceipt(kind, payload)
 
 
 def receipt_matches(receipt: NormalizedReceipt, pending: dict[str, Any]) -> bool:
@@ -116,6 +139,13 @@ def receipt_matches(receipt: NormalizedReceipt, pending: dict[str, Any]) -> bool
     if receipt.kind in {"roster_consent_accepted", "roster_ready", "roster_rejected"}:
         return (
             pending.get("type") == "sonnet.roster.v1"
+            and receipt.payload.get("contest_id") == CONTEST_ID
+            and receipt.payload.get("request_id") == pending.get("request_id")
+            and receipt.payload.get("sender_did") == SARUKU_DID
+        )
+    if receipt.kind in {"submission_accepted", "submission_rejected"}:
+        return (
+            pending.get("type") == "sonnet.submit.v1"
             and receipt.payload.get("contest_id") == CONTEST_ID
             and receipt.payload.get("request_id") == pending.get("request_id")
             and receipt.payload.get("sender_did") == SARUKU_DID

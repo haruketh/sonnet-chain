@@ -14,6 +14,14 @@ class PublisherAuthRequired(PublisherUnavailable):
     pass
 
 
+class PublisherDefinitelyNotSent(PublisherUnavailable):
+    pass
+
+
+class PublishedPost(dict):
+    """Actual fields returned by the Sonnet X publisher adapter."""
+
+
 def canonical_poem(lines: list[str]) -> str:
     if len(lines) != 14 or any(not line.strip() for line in lines):
         raise ValueError("a complete poem requires 14 nonempty lines")
@@ -74,3 +82,40 @@ class CommandPublisher:
         if not isinstance(post_ids, list) or not post_ids or not all(isinstance(x, str) and x for x in post_ids):
             raise PublisherUnavailable("publisher returned invalid post IDs")
         return post_ids
+
+    def publish_part(self, text: str, reply_to: str | None = None) -> PublishedPost:
+        if not self.argv:
+            raise PublisherUnavailable("SONNET_X_PUBLISH_CMD is not set")
+        payload: dict[str, object] = {"posts": [text]}
+        if reply_to is not None:
+            payload["reply_to"] = reply_to
+        try:
+            proc = subprocess.run(
+                self.argv, input=json.dumps(payload), text=True,
+                capture_output=True, check=False, timeout=120,
+            )
+        except OSError as exc:
+            raise PublisherDefinitelyNotSent("publisher process did not start") from exc
+        if proc.returncode == 3:
+            raise PublisherAuthRequired("X_AUTH_REQUIRED")
+        if proc.returncode == 4:
+            raise PublisherDefinitelyNotSent("X rejected the post before creation")
+        if proc.returncode:
+            raise PublisherUnavailable("publisher command failed or delivery is ambiguous")
+        try:
+            result = json.loads(proc.stdout)
+            post_ids = result["post_ids"]
+            posts = result["posts"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise PublisherUnavailable("publisher returned invalid JSON") from exc
+        if (
+            result.get("dry_run") is True
+            or not isinstance(post_ids, list) or len(post_ids) != 1
+            or not isinstance(posts, list) or len(posts) != 1
+            or not isinstance(posts[0], dict)
+            or posts[0].get("id") != post_ids[0]
+            or not isinstance(posts[0].get("text"), str)
+            or not isinstance(posts[0].get("author_id"), str)
+        ):
+            raise PublisherUnavailable("publisher did not confirm exactly one live post")
+        return PublishedPost(posts[0])

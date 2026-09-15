@@ -7,7 +7,10 @@ import pytest
 from sonnet_chain.config import _load_runtime_env
 from sonnet_chain.publisher import CommandPublisher, PublisherUnavailable
 from sonnet_chain.secure_files import SecureFileError, read_private_file
-from sonnet_chain.x_publisher_adapter import XPublisherAdapter, XPublisherError
+from sonnet_chain.x_publisher_adapter import (
+    XPublisherAdapter, XPublisherDefinitelyNotSent, XPublisherError,
+)
+from sonnet_chain.x_oauth import XIdentity
 
 
 class FakeTokenManager:
@@ -20,7 +23,7 @@ class FakeTokenManager:
         return self.token
 
     def verify_identity(self, token):
-        return None
+        return XIdentity("sarukubt", "42")
 
     def is_current(self, token):
         return token == self.token
@@ -60,7 +63,8 @@ def test_x_thread_post_ids_are_persisted_and_reused(tmp_path: Path):
     requests = []
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
-        return httpx.Response(200, json={"data": {"id": str(len(requests))}})
+        body = requests[-1]
+        return httpx.Response(200, json={"data": {"id": str(len(requests)), "text": body["text"]}})
     client = httpx.Client(transport=httpx.MockTransport(handler))
     adapter = XPublisherAdapter(FakeTokenManager(), tmp_path / "publisher.db", client)
     try:
@@ -90,6 +94,30 @@ def test_ambiguous_x_response_blocks_duplicate_retry(tmp_path: Path):
     assert calls == 1
 
 
+def test_same_text_with_different_root_parent_never_reuses_post_id(tmp_path: Path):
+    requests = []
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(200, json={"data": {
+            "id": f"post-{len(requests)}", "text": body["text"],
+        }})
+    adapter = XPublisherAdapter(
+        FakeTokenManager(), tmp_path / "publisher.db",
+        httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        first = adapter.publish(["same"], False, "parent-a")
+        second = adapter.publish(["same"], False, "parent-b")
+    finally:
+        adapter.close()
+    assert first["post_ids"] == ["post-1"]
+    assert second["post_ids"] == ["post-2"]
+    assert [item["reply"]["in_reply_to_tweet_id"] for item in requests] == [
+        "parent-a", "parent-b",
+    ]
+
+
 def test_definite_non_auth_x_rejection_can_retry(tmp_path: Path):
     calls = 0
     def handler(request: httpx.Request) -> httpx.Response:
@@ -97,10 +125,10 @@ def test_definite_non_auth_x_rejection_can_retry(tmp_path: Path):
         calls += 1
         if calls == 1:
             return httpx.Response(403, json={})
-        return httpx.Response(200, json={"data": {"id": "ok"}})
+        return httpx.Response(200, json={"data": {"id": "ok", "text": "first"}})
     adapter = XPublisherAdapter(FakeTokenManager(), tmp_path / "publisher.db", httpx.Client(transport=httpx.MockTransport(handler)))
     try:
-        with pytest.raises(XPublisherError, match="HTTP 403"):
+        with pytest.raises(XPublisherDefinitelyNotSent, match="HTTP 403"):
             adapter.publish(["first"], dry_run=False)
         assert adapter.publish(["first"], dry_run=False)["post_ids"] == ["ok"]
     finally:
@@ -112,6 +140,20 @@ def test_daemon_publisher_rejects_dry_run_ids(monkeypatch):
     monkeypatch.setattr("sonnet_chain.publisher.subprocess.run", lambda *args, **kwargs: result)
     with pytest.raises(PublisherUnavailable, match="dry-run"):
         CommandPublisher("/safe/adapter").publish("poem")
+
+
+def test_command_publisher_returns_actual_create_response_fields(monkeypatch):
+    result = type("Result", (), {
+        "returncode": 0,
+        "stdout": json.dumps({
+            "dry_run": False, "post_ids": ["post-1"],
+            "posts": [{"id": "post-1", "text": "returned", "author_id": "account"}],
+        }),
+    })()
+    monkeypatch.setattr("sonnet_chain.publisher.subprocess.run", lambda *args, **kwargs: result)
+    assert CommandPublisher("/safe/adapter").publish_part("intended") == {
+        "id": "post-1", "text": "returned", "author_id": "account",
+    }
 
 
 def test_runtime_env_is_literal_and_allowlisted(tmp_path: Path, monkeypatch):

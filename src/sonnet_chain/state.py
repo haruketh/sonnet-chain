@@ -183,8 +183,78 @@ class StateStore:
               reconcile_started_at TEXT, reconcile_deadline TEXT,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS entry_closures (
+              game_id TEXT PRIMARY KEY, contest_id TEXT NOT NULL,
+              poem_room TEXT NOT NULL, room_generation INTEGER NOT NULL,
+              final_version INTEGER NOT NULL, final_state_hash TEXT NOT NULL,
+              final_contributor_did TEXT NOT NULL, canonical_poem TEXT NOT NULL,
+              poem_sha256 TEXT NOT NULL, roster_fingerprint TEXT,
+              state TEXT NOT NULL, failure_code TEXT,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS publication_parts (
+              publication_id TEXT NOT NULL, game_id TEXT NOT NULL,
+              final_version INTEGER NOT NULL, poem_sha256 TEXT NOT NULL,
+              part_index INTEGER NOT NULL, part_count INTEGER NOT NULL,
+              exact_content TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+              parent_part_index INTEGER, parent_post_id TEXT,
+              state TEXT NOT NULL, x_post_id TEXT,
+              confirmed_account_id TEXT, confirmed_text TEXT,
+              confirmed_parent_post_id TEXT,
+              strong_confirmation INTEGER NOT NULL DEFAULT 0,
+              attempt_started_at TEXT, confirmed_at TEXT,
+              PRIMARY KEY(publication_id,part_index)
+            );
+            CREATE INDEX IF NOT EXISTS publication_parts_game
+              ON publication_parts(game_id,final_version,part_index);
+            CREATE TABLE IF NOT EXISTS submission_intents (
+              request_id TEXT PRIMARY KEY, game_id TEXT NOT NULL,
+              poem_room TEXT NOT NULL, room_generation INTEGER NOT NULL,
+              final_version INTEGER NOT NULL, final_state_hash TEXT NOT NULL,
+              poem_sha256 TEXT NOT NULL, x_post_ids_json TEXT NOT NULL,
+              packet_json TEXT NOT NULL, packet_sha256 TEXT NOT NULL,
+              state TEXT NOT NULL, created_at TEXT NOT NULL,
+              last_attempt_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT, receipt_seq INTEGER,
+              entry_id TEXT, failure_code TEXT
+            );
+            CREATE INDEX IF NOT EXISTS submission_intents_game
+              ON submission_intents(game_id,state,created_at);
+            CREATE TABLE IF NOT EXISTS participant_commitments (
+              contest_id TEXT NOT NULL, game_id TEXT NOT NULL,
+              roster_fingerprint TEXT, state TEXT NOT NULL,
+              release_entry_id TEXT, release_submission_request_id TEXT,
+              release_receipt_seq INTEGER, release_referee_did TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(contest_id,game_id)
+            );
+            CREATE TABLE IF NOT EXISTS peer_endgame_state (
+              game_id TEXT PRIMARY KEY, final_contributor_did TEXT NOT NULL,
+              final_version INTEGER NOT NULL, frozen_at TEXT NOT NULL,
+              last_progress_at TEXT NOT NULL, last_reminder_at TEXT,
+              reminder_stage INTEGER NOT NULL DEFAULT 0,
+              dedupe_key TEXT, state TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             """
         )
+        self.db.commit()
+        publication_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(publication_parts)").fetchall()
+        }
+        if "confirmed_parent_post_id" not in publication_columns:
+            self.db.execute(
+                "ALTER TABLE publication_parts ADD COLUMN confirmed_parent_post_id TEXT"
+            )
+        submission_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(submission_intents)").fetchall()
+        }
+        for name, definition in (
+            ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_retry_at", "TEXT"),
+        ):
+            if name not in submission_columns:
+                self.db.execute(f"ALTER TABLE submission_intents ADD COLUMN {name} {definition}")
         self.db.commit()
         team_event_columns = {
             row[1] for row in self.db.execute("PRAGMA table_info(team_events)").fetchall()

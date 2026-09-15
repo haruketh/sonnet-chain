@@ -18,6 +18,10 @@ from .decision import (
     Action, build_decision_state, coordination_key, coordination_text, decide,
     validate_decision,
 )
+from .entry_closure import (
+    EntryClosureStore, PeerFinalCoordinator, PublicationDelivery, PublicationIntegrity,
+    assess_publication_integrity, frozen_input_from_state, reconcile_frozen_poem,
+)
 from .launch import TrustedLaunch, owner_did, verify_launch_record
 from .journal import Journal
 from .invites import (
@@ -33,8 +37,11 @@ from .invites import (
 from .llm import LLMClient, LLMUnavailable, RECEIPT_SCHEMA
 from .official import sha256, verify_package
 from .poetry import PoemState, build_word_index
-from .protocol import discovery_advertisement, register_writer, request_id, submit, team_application, withdraw, word
-from .publisher import CommandPublisher, PublisherAuthRequired, PublisherUnavailable, canonical_poem
+from .protocol import compact, discovery_advertisement, register_writer, request_id, team_application, withdraw, word
+from .publisher import (
+    CommandPublisher, PublisherAuthRequired, PublisherDefinitelyNotSent,
+    PublisherUnavailable,
+)
 from .receipts import NormalizedReceipt, normalize_llm_receipt, receipt_candidate, receipt_matches
 from .rosters import (
     CanonicalRoster, current_roster_signers, roster_consensus, signed_roster,
@@ -53,6 +60,7 @@ from .team_formation import (
     targeted_recruitment_note,
 )
 from .writing import WritingPlanner, build_writing_context, validate_writing_candidate
+from .x_oauth import XOAuthError, XTokenManager
 
 def before_deadline(store: StateStore) -> bool:
     value = store.get("deadline")
@@ -782,7 +790,11 @@ class Daemon:
                 room == ROOMS.registration
                 and receipt.kind == "registration_accepted"
             )
-            accepted = actionable or trusted_registration
+            trusted_submission = (
+                room == ROOMS.submissions
+                and receipt.kind in {"submission_accepted", "submission_rejected"}
+            )
+            accepted = actionable or trusted_registration or trusted_submission
             if existing is None:
                 with self.state.db:
                     self.state.db.execute(
@@ -792,8 +804,19 @@ class Daemon:
                          json.dumps(receipt.payload), int(accepted)),
                     )
             self.state.mark_receipt_event_processed(room, generation, seq, "normalized")
+            peer_release = False
+            if not actionable and receipt.kind == "submission_accepted":
+                peer_release = EntryClosureStore(
+                    self.state
+                ).release_from_generic_peer_receipt(
+                    receipt.payload, seq, referee,
+                    record_time(raw) or datetime.now(timezone.utc),
+                )
             if not actionable:
                 self.state.mark_receipt_event_processed(room, generation, seq, "done")
+                if peer_release and self.state.active_team() == receipt.payload.get("entry_id"):
+                    self.state.set("submission_state", "accepted")
+                    self.state.phase = Phase.DONE
                 continue
             self._journal(
                 "receipt_accepted",
@@ -897,12 +920,26 @@ class Daemon:
             elif receipt.kind == "word_rejected":
                 self.state.set_request_status(request_id, "rejected")
             elif receipt.kind == "submission_accepted":
-                self.state.set_request_status(request_id, "accepted")
-                self.state.set("submission_state", "accepted")
-                self.state.phase = Phase.DONE
+                game_id = pending.get("game_id") if pending else None
+                entry_id = receipt.payload.get("entry_id")
+                if isinstance(game_id, str) and isinstance(entry_id, str) and entry_id:
+                    released = EntryClosureStore(self.state).accept_submission(
+                        game_id, request_id, entry_id, seq, referee,
+                        record_time(raw) or datetime.now(timezone.utc),
+                    )
+                    if released:
+                        self.state.set_request_status(request_id, "accepted")
+                        self.state.set("submission_state", "accepted")
+                        if self.state.active_team() == game_id:
+                            self.state.phase = Phase.DONE
+                else:
+                    self.state.set("last_error", "submission receipt missing entry_id")
             elif receipt.kind == "submission_rejected":
                 self.state.set_request_status(request_id, "rejected")
                 self.state.set("submission_state", "rejected")
+                EntryClosureStore(self.state).reject_submission(
+                    request_id, str(receipt.payload.get("reason") or "SUBMISSION_REJECTED")
+                )
             self.state.mark_receipt_event_processed(room, generation, seq, "done")
 
     def _discovery(self) -> None:
@@ -2181,53 +2218,274 @@ class Daemon:
         self._post(poem_room, payload)
 
     def _poem_complete(self) -> None:
-        if self.state.get("final_contributor") == SARUKU_DID:
-            self.state.phase = Phase.PUBLISH_IF_FINAL_CONTRIBUTOR
-        else:
+        source = frozen_input_from_state(self.state)
+        if source is None:
+            self.state.set("last_error", "FROZEN_POEM_RECONCILIATION_FAILED")
+            return
+        result = reconcile_frozen_poem(source)
+        if not result.ok:
+            self.state.set("last_error", result.failure_code)
+            return
+        store = EntryClosureStore(self.state)
+        now = datetime.now(timezone.utc)
+        store.save_reconciliation(source, result, now)
+        if source.final_contributor_did != SARUKU_DID:
+            PeerFinalCoordinator(store).observe(source, now)
             self.state.phase = Phase.WAIT_SUBMISSION_RECEIPT
+            return
+        store.prepare_publication(source, result, now)
+        self.state.phase = Phase.PUBLISH_IF_FINAL_CONTRIBUTOR
 
     def _publish(self) -> None:
         if not self.live or not before_deadline(self.state):
             return
-        if self.state.get("x_post_ids"):
+        game_id = self.state.active_team()
+        if not isinstance(game_id, str):
+            return
+        store = EntryClosureStore(self.state)
+        parts = store.parts(game_id)
+        if not parts:
+            self.state.set("last_error", "FROZEN_POEM_RECONCILIATION_FAILED")
+            return
+        if store.publication_complete(game_id):
+            self.state.set("x_post_ids", [item["x_post_id"] for item in parts])
             self.state.phase = Phase.SUBMIT
             return
-        lines = self.state.get("poem_lines", [])
-        try:
-            post_ids = CommandPublisher(self.cfg.x_publish_cmd).publish(canonical_poem(lines))
-        except PublisherAuthRequired as exc:
-            self.state.set("last_error", str(exc))
-            self.state.phase = Phase.X_AUTH_REQUIRED
+        unresolved = next((item for item in parts if item["state"] in {
+            PublicationDelivery.SEND_INTENT_PERSISTED.value,
+            PublicationDelivery.DELIVERY_UNKNOWN.value,
+        }), None)
+        if unresolved is not None:
+            if unresolved["state"] == PublicationDelivery.SEND_INTENT_PERSISTED.value:
+                store.publication_result(
+                    unresolved["publication_id"], unresolved["part_index"],
+                    PublicationDelivery.DELIVERY_UNKNOWN, datetime.now(timezone.utc),
+                )
+            manager = XTokenManager(
+                self.cfg.x_client_id_file, self.cfg.x_client_secret_file,
+                self.cfg.x_token_file, self.cfg.x_expected_username,
+            )
+            try:
+                token = manager.get_valid_access_token()
+                identity = manager.verify_identity(token)
+                response = manager.client.get(
+                    f"https://api.x.com/2/users/{identity.user_id}/tweets",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"max_results": 100,
+                            "tweet.fields": "author_id,created_at,referenced_tweets"},
+                )
+                if response.status_code == 200:
+                    matches = []
+                    for item in response.json().get("data", []):
+                        refs = item.get("referenced_tweets", [])
+                        parent = next((ref.get("id") for ref in refs
+                                       if ref.get("type") == "replied_to"), None)
+                        matches.append({**item, "parent_post_id": parent})
+                    store.recover_unknown(
+                        unresolved["publication_id"], unresolved["part_index"],
+                        matches, identity.user_id, datetime.now(timezone.utc),
+                    )
+            except (XOAuthError, httpx.HTTPError, ValueError, TypeError):
+                pass
+            finally:
+                manager.close()
+            self.state.set("last_error", "PUBLICATION_DELIVERY_UNKNOWN")
             return
-        except (PublisherUnavailable, ValueError) as exc:
-            self.state.set("last_error", f"PublisherUnavailable: {exc}")
+        candidate = next((item for item in parts if item["state"] in {
+            PublicationDelivery.PLANNED.value,
+            PublicationDelivery.DEFINITELY_NOT_SENT.value,
+        }), None)
+        if candidate is None:
+            return
+        if not self.cfg.x_publish_cmd:
+            self.state.set("last_error", "SARUKU_FINAL_NOT_READY")
             self.state.phase = Phase.WAIT_PUBLISHER
             return
-        self.state.set("x_post_ids", post_ids)
-        self.state.increment("x_write_count", len(post_ids))
-        self.state.phase = Phase.SUBMIT
+        manager = XTokenManager(
+            self.cfg.x_client_id_file, self.cfg.x_client_secret_file,
+            self.cfg.x_token_file, self.cfg.x_expected_username,
+        )
+        try:
+            token = manager.get_valid_access_token()
+            identity = manager.verify_identity(token)
+        except XOAuthError as exc:
+            mismatch = "does not match" in str(exc)
+            self.state.set("last_error", "X_ACCOUNT_MISMATCH" if mismatch else "X_AUTH_REQUIRED")
+            self.state.phase = Phase.WAIT_PUBLISHER if mismatch else Phase.X_AUTH_REQUIRED
+            return
+        finally:
+            manager.close()
+        intent = store.persist_publication_intent(
+            candidate["publication_id"], candidate["part_index"], datetime.now(timezone.utc)
+        )
+        if intent is None:
+            return
+        try:
+            published = CommandPublisher(self.cfg.x_publish_cmd).publish_part(
+                intent["exact_content"], intent["parent_post_id"]
+            )
+        except PublisherAuthRequired:
+            store.publication_result(
+                intent["publication_id"], intent["part_index"],
+                PublicationDelivery.DEFINITELY_NOT_SENT, datetime.now(timezone.utc),
+            )
+            self.state.set("last_error", "X_AUTH_REQUIRED")
+            self.state.phase = Phase.X_AUTH_REQUIRED
+            return
+        except PublisherDefinitelyNotSent:
+            store.publication_result(
+                intent["publication_id"], intent["part_index"],
+                PublicationDelivery.DEFINITELY_NOT_SENT, datetime.now(timezone.utc),
+            )
+            self.state.set("last_error", "X_PUBLICATION_REJECTED")
+            self.state.phase = Phase.WAIT_PUBLISHER
+            return
+        except (PublisherUnavailable, ValueError):
+            store.publication_result(
+                intent["publication_id"], intent["part_index"],
+                PublicationDelivery.DELIVERY_UNKNOWN, datetime.now(timezone.utc),
+            )
+            self.state.set("last_error", "PUBLICATION_DELIVERY_UNKNOWN")
+            return
+        store.publication_result(
+            intent["publication_id"], intent["part_index"],
+            PublicationDelivery.CONFIRMED, datetime.now(timezone.utc),
+            post_id=published["id"], account_id=published["author_id"],
+            returned_text=published["text"],
+            returned_parent_post_id=published.get("parent_post_id"),
+            expected_account_id=identity.user_id,
+        )
+        self.state.increment("x_write_count")
 
     def _submit(self) -> None:
-        import hashlib
-
-        if not self.live or not before_deadline(self.state):
+        if not self.live:
             return
-        lines = self.state.get("poem_lines", [])
-        setup = self.state.get("team_setup", {})
         game_id = self.state.active_team()
-        poem_room = self.state.get("poem_room")
-        post_ids = self.state.get("x_post_ids", [])
-        if not all((isinstance(game_id, str), isinstance(poem_room, str), isinstance(setup.get("room_generation"), int), post_ids)):
+        if not isinstance(game_id, str):
             return
-        text = canonical_poem(lines)
-        payload = self.state.pending_request("submit") or submit(
-            game_id, poem_room, setup["room_generation"], int(self.state.get("poem_version", 0)),
-            hashlib.sha256(text.encode()).hexdigest(), post_ids,
+        store = EntryClosureStore(self.state)
+        source = store.frozen_source(game_id)
+        closure = store.closure(game_id)
+        deadline_value = self.state.get("deadline")
+        if source is None or closure is None or not isinstance(deadline_value, str):
+            return
+        deadline = datetime.fromisoformat(deadline_value.replace("Z", "+00:00"))
+        integrity = PublicationIntegrity.UNRESOLVED
+        manager = XTokenManager(
+            self.cfg.x_client_id_file, self.cfg.x_client_secret_file,
+            self.cfg.x_token_file, self.cfg.x_expected_username,
         )
+        try:
+            token = manager.get_valid_access_token()
+            identity = manager.verify_identity(token)
+            ids = [item["x_post_id"] for item in store.parts(game_id)]
+            response = manager.client.get(
+                "https://api.x.com/2/tweets",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"ids": ",".join(ids),
+                        "tweet.fields": "author_id,created_at,referenced_tweets,edit_history_tweet_ids"},
+            )
+            if response.status_code == 200:
+                observed = []
+                for item in response.json().get("data", []):
+                    refs = item.get("referenced_tweets", [])
+                    parent = next((ref.get("id") for ref in refs
+                                   if ref.get("type") == "replied_to"), None)
+                    observed.append({**item, "parent_post_id": parent})
+                body = response.json()
+                integrity = assess_publication_integrity(
+                    store.parts(game_id), observed, identity.user_id, deadline,
+                    body.get("errors") if isinstance(body, dict) else None,
+                )
+        except XOAuthError as exc:
+            if "does not match" in str(exc):
+                integrity = PublicationIntegrity.CONFLICT
+        except (httpx.HTTPError, ValueError, TypeError):
+            pass
+        finally:
+            manager.close()
+        if integrity == PublicationIntegrity.CONFLICT:
+            self.state.set("last_error", "PUBLICATION_INTEGRITY_CONFLICT")
+            return
+        attempts_key = f"publication_integrity_attempts:{game_id}"
+        attempts = int(self.state.get(attempts_key, 0) or 0) + 1
+        self.state.set(attempts_key, attempts)
+        now = datetime.now(timezone.utc)
+        if (
+            integrity == PublicationIntegrity.UNRESOLVED and attempts < 2
+            and now < deadline - timedelta(minutes=2)
+        ):
+            self.state.set("last_error", "PUBLICATION_INTEGRITY_UNRESOLVED")
+            return
+        payload = store.prepare_submission(
+            source, closure["poem_sha256"], integrity, now, deadline,
+        )
+        if payload is None:
+            self.state.set("last_error", "PUBLICATION_INTEGRITY_UNRESOLVED")
+            return
         if self.state.pending_request("submit") is None:
             self.state.reserve_request(payload["request_id"], "submit", payload)
-        self._post(ROOMS.submissions, payload)
+        store.mark_submission_attempt(payload["request_id"], now)
+        try:
+            self._post(ROOMS.submissions, payload)
+        except Exception:
+            pass
         self.state.phase = Phase.WAIT_SUBMISSION_RECEIPT
+
+    def _reconcile_submission_delivery(self) -> bool:
+        """Retry one exact ambiguous submission packet after a durable interval."""
+        game_id = self.state.active_team()
+        if not self.live or not isinstance(game_id, str):
+            return False
+        store = EntryClosureStore(self.state)
+        source = store.frozen_source(game_id)
+        now = datetime.now(timezone.utc)
+        pending = store.submission_retry_due(game_id, now)
+        if (
+            source is None or source.final_contributor_did != SARUKU_DID
+            or pending is None
+        ):
+            return False
+        try:
+            payload = json.loads(pending["packet_json"])
+        except (KeyError, TypeError, json.JSONDecodeError):
+            self.state.set("last_error", "SUBMISSION_DELIVERY_UNKNOWN")
+            return False
+        if (
+            payload.get("request_id") != pending["request_id"]
+            or hashlib.sha256(compact(payload).encode()).hexdigest()
+            != pending["packet_sha256"]
+        ):
+            self.state.set("last_error", "SUBMISSION_DELIVERY_UNKNOWN")
+            return False
+        store.mark_submission_attempt(pending["request_id"], now)
+        try:
+            self._post(ROOMS.submissions, payload)
+        except Exception:
+            pass
+        return True
+
+    def _peer_endgame(self) -> None:
+        game_id = self.state.active_team()
+        deadline_value = self.state.get("deadline")
+        if not isinstance(game_id, str) or not isinstance(deadline_value, str):
+            return
+        row = self.state.db.execute(
+            "SELECT final_contributor_did FROM peer_endgame_state WHERE game_id=?",
+            (game_id,),
+        ).fetchone()
+        if row is None or row["final_contributor_did"] == SARUKU_DID:
+            return
+        reminder = PeerFinalCoordinator(EntryClosureStore(self.state)).reminder(
+            game_id, datetime.now(timezone.utc),
+            datetime.fromisoformat(deadline_value.replace("Z", "+00:00")),
+        )
+        if reminder is None or not self.live:
+            return
+        poem_room = self.state.get("poem_room")
+        if isinstance(poem_room, str):
+            self.state.reserve_request(reminder["request_id"], "peer_endgame_reminder", reminder)
+            self._post(poem_room, reminder)
 
     def cycle(self) -> None:
         phase = self.state.phase
@@ -2252,10 +2510,29 @@ class Daemon:
             self._poem_complete()
         elif phase == Phase.PUBLISH_IF_FINAL_CONTRIBUTOR:
             self._publish()
+        elif phase in {Phase.WAIT_PUBLISHER, Phase.X_AUTH_REQUIRED}:
+            self._publish()
         elif phase == Phase.SUBMIT:
             self._submit()
         elif phase == Phase.WAIT_SUBMISSION_RECEIPT:
             self._receipts(ROOMS.submissions)
+            if self.state.phase == Phase.WAIT_SUBMISSION_RECEIPT:
+                wrote = self._reconcile_submission_delivery()
+                if not wrote:
+                    self._peer_endgame()
+        elif phase == Phase.DONE:
+            game_id = self.state.active_team()
+            commitment = (
+                EntryClosureStore(self.state).commitment(game_id)
+                if isinstance(game_id, str) else None
+            )
+            if (
+                commitment is not None and commitment["state"] == "RELEASED"
+                and before_deadline(self.state)
+            ):
+                self.state.set("active_team", None)
+                self.state.set("team_setup", None)
+                self.state.phase = Phase.DISCOVERY
 
         phase_after = self.state.phase
         if phase_after != phase_before:
